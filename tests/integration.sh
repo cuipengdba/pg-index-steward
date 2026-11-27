@@ -240,4 +240,18 @@ SQL
     done
     same "$(sql "SELECT state FROM index_steward.jobs WHERE action='analyze' AND target='public.needs_stats'::regclass ORDER BY id DESC LIMIT 1")" done
 fi
+if [[ $(sql "SELECT to_regprocedure('index_steward.alerts()') IS NOT NULL") == t ]]; then
+    sql "SELECT index_steward.set_paused(true)" >/dev/null
+    same "$(sql 'SELECT paused FROM index_steward.policy')" t
+    psql -q <<'SQL'
+INSERT INTO index_steward.jobs(action,target,signature,detail,state,reason)
+VALUES ('create','public.devices'::regclass,'alert-fixture','{}','failed','fixture');
+GRANT EXECUTE ON FUNCTION index_steward.alerts() TO metrics_reader;
+SQL
+    worker --observe-only
+    PGUSER=metrics_reader worker --alerts | grep '"kind": "failed"' >/dev/null
+    grep -q 'PG Index Steward .*"event":"alert"' "$tmp/server.log"
+    sql "SELECT index_steward.set_paused(false)" >/dev/null
+    same "$(sql 'SELECT paused FROM index_steward.policy')" f
+fi
 printf 'Integration passed: %s\n' "$("$pg_config" --version)"

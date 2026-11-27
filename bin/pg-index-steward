@@ -726,7 +726,7 @@ def ddl_budget(db, policy, job):
     if job['action'] == 'analyze':
         enabled = current and current.get('auto_analyze')
     if (not current or current['paused'] or seconds < MIN_DDL_WINDOW_SECONDS or
-            not enabled or not allowed_by_policy(job, current)):
+            not enabled or not allowed_by_policy(job, current) or not rollout_allows(job, current)):
         defer_job(db, job, 'window_or_policy_changed', policy)
         return 0
     # Give a timed-out build another chance with a larger budget, subject to
@@ -1076,6 +1076,30 @@ def allowed_by_policy(job, policy):
             (tables is None or relation(schema, table) in tables))
 
 
+def rollout_allows(job, policy):
+    if job['detail'].get('rollback'):
+        return True
+    # A table stays in the selected cohort as the percentage increases.
+    table = relation(job['detail']['schema'], job['detail']['table'])
+    bucket = int.from_bytes(hashlib.sha256(table.encode()).digest()[:4], 'big') % 100
+    return bucket < policy['rollout_percent']
+
+
+def emit_alerts(db):
+    rows = db.execute(f"""WITH pending AS (
+        SELECT a.* FROM {SCHEMA}.alerts() a LEFT JOIN {SCHEMA}.alert_history h
+          ON h.job_id=a.job_id AND h.kind=a.kind
+        WHERE h.emitted_at IS NULL OR h.emitted_at<now()-interval '24 hours'
+        ORDER BY a.created_at LIMIT 50
+    ), emitted AS (
+        INSERT INTO {SCHEMA}.alert_history(job_id,kind) SELECT job_id,kind FROM pending
+        ON CONFLICT (job_id,kind) DO UPDATE SET emitted_at=now()
+        RETURNING job_id,kind
+    ) SELECT row_to_json(p) FROM pending p JOIN emitted e USING(job_id,kind)""")
+    for entry in map(json.loads, rows):
+        event(db, 'alert', {'id': entry['job_id'], 'action': entry['action']}, entry['kind'])
+
+
 def recover_jobs(db, policy):
     for job in db.rows(f"SELECT * FROM {SCHEMA}.jobs WHERE state='running'"):
         detail = job['detail']
@@ -1133,6 +1157,7 @@ def run_cycle(db, cfg, allow_ddl):
         observe_indexes(db, policy)
         verified_replicas = observe_replicas(db, policy)
         measure(db, deltas, policy)
+        emit_alerts(db)
         if not allow_ddl or policy['paused']:
             return
         if not primary_ready:
@@ -1169,6 +1194,9 @@ def run_cycle(db, cfg, allow_ddl):
                 return
             if not allowed_by_policy(job, policy):
                 defer_job(db, job, 'outside_allowlist', policy)
+                continue
+            if not rollout_allows(job, policy):
+                defer_job(db, job, 'outside_rollout', policy)
                 continue
             guards = protect(db, job)
             guards['verified_replicas'] = verified_replicas
@@ -1225,8 +1253,9 @@ def main():
     output = parser.add_mutually_exclusive_group()
     output.add_argument('--status', action='store_true')
     output.add_argument('--metrics', action='store_true')
+    output.add_argument('--alerts', action='store_true')
     args = parser.parse_args()
-    if args.status or args.metrics:
+    if args.status or args.metrics or args.alerts:
         if args.service and args.conninfo:
             parser.error('--service and --conninfo are mutually exclusive')
         aggregate = []
@@ -1236,9 +1265,10 @@ def main():
             db = None
             try:
                 db = Database(args.libpq, f'service={service} connect_timeout=5' if service else args.conninfo)
-                rows = report(db, args.metrics, service, headers=position == 0)
+                rows = (db.rows(f'SELECT * FROM {SCHEMA}.alerts() ORDER BY created_at LIMIT 500') if args.alerts
+                        else report(db, args.metrics, service, headers=position == 0))
                 if rows is not None:
-                    aggregate.append({'service': service, 'status': rows})
+                    aggregate.append({'service': service, 'alerts' if args.alerts else 'status': rows})
             except (DatabaseError, OSError) as exc:
                 print(f'Status query failed ({getattr(exc, "sqlstate", None) or type(exc).__name__})', file=sys.stderr)
                 return 1
@@ -1249,7 +1279,7 @@ def main():
             print(json.dumps(aggregate, indent=2, ensure_ascii=False))
         return 0
     if args.service:
-        parser.error('--service requires --status or --metrics')
+        parser.error('--service requires --status, --metrics, or --alerts')
     if not args.once and args.interval < 60:
         parser.error('--interval must be at least 60 seconds')
     while True:
