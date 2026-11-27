@@ -103,6 +103,21 @@ sql "UPDATE index_steward.policy SET min_free_bytes=0; UPDATE index_steward.jobs
 worker
 same "$(sql 'SELECT count(*) FROM index_steward.managed_indexes WHERE retired_at IS NULL')" 1
 same "$(sql "SELECT count(*) FROM index_steward.verdicts WHERE state='observing'")" 1
+if [[ $(sql "SELECT to_regclass('index_steward.latency_samples') IS NOT NULL") == t ]]; then
+    python3 - "$root/bin/pg-index-steward" "$pglib/libpq.so.5" <<'PY'
+import runpy, sys
+steward = runpy.run_path(sys.argv[1])
+db = steward['Database'](sys.argv[2], '')
+try:
+    original = db.one('SELECT baseline->0 AS sample FROM index_steward.verdicts')['sample']
+    for _ in range(3):
+        steward['measure'](db, [{**original, 'calls': 50, 'elapsed': original['elapsed'] / 10}], {})
+    verdict = db.one('SELECT state, comparison FROM index_steward.verdicts')
+    assert verdict['state'] == 'improved' and verdict['comparison'][0]['calls'] == 150, verdict
+finally:
+    db.close()
+PY
+fi
 
 worker --observe-only
 sql "UPDATE index_steward.index_usage SET idle_since=clock_timestamp()-interval '61 days'"

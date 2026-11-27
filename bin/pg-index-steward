@@ -471,7 +471,8 @@ def propose_indexes(db, qstats, deltas, policy):
                                          estimated_table_bytes=target['bytes']))
             detail['advisory'] = detail['advisory'] and item.get('advisory', False)
             detail['score'] += row['elapsed']
-            sample = {k: row[k] for k in ('userid', 'queryid', 'toplevel', 'calls', 'elapsed', 'reads', 'hits')}
+            sample = {k: row[k] for k in ('userid', 'queryid', 'toplevel', 'calls', 'elapsed', 'reads', 'hits',
+                                         'wal_bytes', 'sampled_epoch', 'period_seconds')}
             if sample not in detail['samples']:
                 detail['samples'].append(sample)
     for position, ((target, sig), detail) in enumerate(rank_portfolio(proposals)):
@@ -928,20 +929,25 @@ def drop_index(db, job, cfg, guards, remaining, policy):
 
 def measure(db, deltas, policy):
     lookup = {(x['userid'], x['queryid'], x['toplevel']): x for x in deltas}
-    for row in db.rows(f"SELECT * FROM {SCHEMA}.verdicts WHERE state='observing' ORDER BY job_id LIMIT 30"):
+    for row in db.rows(f"SELECT * FROM {SCHEMA}.verdicts WHERE state='observing' AND baseline<>'[]'::jsonb "
+                       "ORDER BY updated_at,job_id LIMIT 30"):
         baseline = row['baseline']
         history = row['observations']
         for item in baseline:
             k = item['userid'], item['queryid'], item['toplevel']
             sample = lookup.get(k)
             if sample:
-                history.append({name: sample[name] for name in ('userid','queryid','toplevel','calls','elapsed','reads','hits','wal_bytes')})
-        if not history:
-            continue
+                history.append({name: sample[name] for name in ('userid','queryid','toplevel','calls','elapsed','reads','hits','wal_bytes',
+                                                                 'sampled_epoch','period_seconds')})
         results = []
         strong_regression = []
+        comparison = []
         for item in baseline:
             selected = [x for x in history if all(x[key] == item[key] for key in ('userid','queryid','toplevel'))]
+            if item.get('period_seconds', 0) > 0:
+                rate = item['calls'] / item['period_seconds']
+                selected = [x for x in selected if x.get('period_seconds', 0) > 0 and
+                            rate / 4 <= x['calls'] / x['period_seconds'] <= rate * 4]
             calls = sum(x['calls'] for x in selected)
             if calls >= OBS_MIN_CALLS and len(selected) >= 3:
                 observed = sum(x['elapsed'] for x in selected) / calls
@@ -953,11 +959,24 @@ def measure(db, deltas, policy):
                 blocks_old = (item['hits'] + item['reads']) / item['calls']
                 blocks_new = sum(x['hits'] + x['reads'] for x in selected) / calls
                 strong_regression.append(ratio >= 2 and blocks_old > 0 and blocks_new >= blocks_old * 1.5)
+                result = {'queryid': item['queryid'], 'mean_ratio': ratio, 'calls': calls,
+                          'mean_blocks_before': blocks_old, 'mean_blocks_after': blocks_new,
+                          'wal_bytes_per_call_before': item.get('wal_bytes', 0) / item['calls'],
+                          'wal_bytes_per_call_after': sum(x.get('wal_bytes', 0) for x in selected) / calls}
+                if item.get('sampled_epoch') and all(x.get('sampled_epoch') for x in selected):
+                    for name, stamp in [('baseline',item['sampled_epoch']),('observed',selected[-1]['sampled_epoch'])]:
+                        metric = db.one(f"SELECT p95_ms FROM {SCHEMA}.latency_samples WHERE queryid={item['queryid']} "
+                                        f"AND sampled_at BETWEEN to_timestamp({stamp})-interval '15 minutes' AND to_timestamp({stamp}) "
+                                        'AND calls>=100 ORDER BY sampled_at DESC LIMIT 1')
+                        if metric:
+                            result[f'{name}_p95_ms'] = metric['p95_ms']
+                comparison.append(result)
         state = 'observing'
         if results and len(results) == len(baseline):
             state = 'regression_review' if max(results) > 1.20 else ('improved' if max(results) <= 0.80 else 'mixed')
         db.execute(f"""UPDATE {SCHEMA}.verdicts SET observations={json_value(history[-300:])},
-                       state={literal(state)},updated_at=clock_timestamp() WHERE job_id={row['job_id']}""")
+                       comparison={json_value(comparison)},state={literal(state)},
+                       updated_at=clock_timestamp() WHERE job_id={row['job_id']}""")
         if state != 'observing':
             event(db, 'verdict', {'id': row['job_id'], 'action': 'create'}, state)
         if state == 'regression_review' and policy.get('auto_rollback') and all(strong_regression):
