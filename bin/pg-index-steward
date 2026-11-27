@@ -557,6 +557,17 @@ def observe_indexes(db, policy):
                     idle_since=excluded.idle_since, reset_marker=excluded.reset_marker""")
 
 
+def propose_statistics(db, policy):
+    if not policy['auto_analyze']:
+        return
+    candidates = db.rows(f"""SELECT relid,schemaname AS schema,relname AS table,n_mod_since_analyze
+        FROM {SCHEMA}.table_health WHERE analyze_candidate
+        ORDER BY n_mod_since_analyze DESC,relid LIMIT 10""")
+    for row in candidates:
+        if eligible_table(db, row['schema'], row['table']):
+            upsert_job(db, 'analyze', row['relid'], 'analyze', row)
+
+
 def observe_replicas(db, policy):
     services = set(policy['replica_services'])
     if not services:
@@ -712,6 +723,8 @@ def ddl_budget(db, policy, job):
     drop_enabled = (job['detail'].get('rollback') or
                     cfg['auto_drop_managed' if managed else 'auto_drop_existing'])
     enabled = cfg['auto_create'] if job['action'] == 'create' else drop_enabled
+    if job['action'] == 'analyze':
+        enabled = current and current.get('auto_analyze')
     if (not current or current['paused'] or seconds < MIN_DDL_WINDOW_SECONDS or
             not enabled or not allowed_by_policy(job, current)):
         defer_job(db, job, 'window_or_policy_changed', policy)
@@ -915,6 +928,37 @@ def create_index(db, job, cfg, remaining, policy):
     return True
 
 
+def analyze_table(db, job, policy):
+    detail = job['detail']
+    target = eligible_table(db, detail['schema'], detail['table'])
+    if not target or target['oid'] != job['target']:
+        update_job(db, job, 'cancelled', 'Table identity changed', 'table_identity')
+        return False
+    health = db.one(f"SELECT analyze_candidate FROM {SCHEMA}.table_health WHERE relid={int(job['target'])}")
+    if not health or not health['analyze_candidate']:
+        update_job(db, job, 'cancelled', 'Statistics already fresh', 'statistics_fresh')
+        return False
+    if target['bytes'] > policy['max_table_bytes']:
+        defer_job(db, job, 'table_size_policy', policy)
+        return False
+    budget = ddl_budget(db, policy, job)
+    if not budget:
+        return False
+    update_job(db, job, 'running', 'Refreshing table statistics')
+    try:
+        db.execute(f"SET statement_timeout='{budget}s'")
+        db.execute(f"ANALYZE {relation(detail['schema'], detail['table'])}")
+        update_job(db, job, 'done', 'Table statistics refreshed', 'statistics_refreshed')
+    except DatabaseError as error:
+        if retryable(error):
+            defer_job(db, job, error.sqlstate, policy, attempted=True)
+        else:
+            update_job(db, job, 'failed', 'ANALYZE failed', error.sqlstate)
+    finally:
+        db.execute("SET statement_timeout='15s'")
+    return True
+
+
 def drop_index(db, job, cfg, guards, remaining, policy):
     rows = index_inventory(db, job['target'], policy['idle_days'])
     if not rows or rows[0]['fingerprint'] != job['signature']:
@@ -1035,6 +1079,9 @@ def allowed_by_policy(job, policy):
 def recover_jobs(db, policy):
     for job in db.rows(f"SELECT * FROM {SCHEMA}.jobs WHERE state='running'"):
         detail = job['detail']
+        if job['action'] == 'analyze':
+            defer_job(db, job, 'interrupted_analyze', policy)
+            continue
         if detail.get('partition'):
             defer_job(db, job, 'interrupted_partition_step', policy)
             continue
@@ -1082,6 +1129,7 @@ def run_cycle(db, cfg, allow_ddl):
         record_diagnostics(db, qstats, deltas)
         propose_indexes(db, qstats, deltas, policy)
         queue_partition_repairs(db, policy)
+        propose_statistics(db, policy)
         observe_indexes(db, policy)
         verified_replicas = observe_replicas(db, policy)
         measure(db, deltas, policy)
@@ -1106,6 +1154,7 @@ def run_cycle(db, cfg, allow_ddl):
                        AND (action<>'create' OR COALESCE((detail->>'partition')::boolean,false)
                            OR evidence_at>clock_timestamp()-interval '7 days')
                        AND (action<>'create' OR {literal(cfg['auto_create'])})
+                       AND (action<>'analyze' OR {literal(policy['auto_analyze'])})
                        AND (action<>'drop' OR COALESCE((detail->>'rollback')::boolean,false)
                            OR CASE WHEN COALESCE((detail->>'managed')::boolean,false)
                                    THEN {literal(cfg['auto_drop_managed'])} ELSE {literal(cfg['auto_drop_existing'])} END)
@@ -1135,6 +1184,8 @@ def run_cycle(db, cfg, allow_ddl):
             elif job['action'] == 'drop':
                 if drop_index(db, job, cfg, guards, remaining, policy):
                     return
+            elif job['action'] == 'analyze' and analyze_table(db, job, policy):
+                return
 
 
 def report(db, as_metrics=False, service=None, headers=True):

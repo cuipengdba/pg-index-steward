@@ -223,4 +223,21 @@ SQL
     worker
     same "$(sql "SELECT state FROM index_steward.jobs WHERE signature='large-first'")" done
 fi
+if [[ $(sql "SELECT to_regclass('index_steward.table_health') IS NOT NULL") == t ]]; then
+    psql -q <<'SQL'
+CREATE TABLE public.needs_stats(id int);
+ALTER TABLE public.needs_stats SET (autovacuum_enabled=false);
+INSERT INTO public.needs_stats SELECT generate_series(1,3000);
+SQL
+    for _ in {1..30}; do
+        [[ $(sql "SELECT analyze_candidate FROM index_steward.table_health WHERE relname='needs_stats'") == t ]] && break
+        sleep .2
+    done
+    sql 'UPDATE index_steward.policy SET auto_analyze=true' >/dev/null
+    for _ in {1..6}; do
+        worker
+        [[ $(sql "SELECT state FROM index_steward.jobs WHERE action='analyze' AND target='public.needs_stats'::regclass ORDER BY id DESC LIMIT 1") == done ]] && break
+    done
+    same "$(sql "SELECT state FROM index_steward.jobs WHERE action='analyze' AND target='public.needs_stats'::regclass ORDER BY id DESC LIMIT 1")" done
+fi
 printf 'Integration passed: %s\n' "$("$pg_config" --version)"
