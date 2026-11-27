@@ -41,6 +41,11 @@ ANALYZE public.devices;
 CREATE INDEX existing_index ON public.devices(realm);
 CREATE TABLE public.other(id int primary key);
 SQL
+version=$(sed -nE "s/^default_version = '([^']+)'$/\1/p" "$root/pg_index_steward.control")
+same "$(sql "SELECT extversion FROM pg_extension WHERE extname='pg_index_steward'")" "$version"
+sql 'CREATE DATABASE steward_fresh_install' >/dev/null
+PGDATABASE=steward_fresh_install sql 'CREATE EXTENSION pg_stat_statements; CREATE EXTENSION pg_index_steward' >/dev/null
+same "$(PGDATABASE=steward_fresh_install sql "SELECT extversion FROM pg_extension WHERE extname='pg_index_steward'")" "$version"
 same "$(sql "SELECT auto_create||','||maintenance_window||','||auto_drop_existing||','||auto_drop_managed FROM index_steward.settings()")" 'true,23:00-06:00,false,true'
 same "$(sql "SELECT index_steward.candidates('SELECT * FROM public.devices WHERE id=42')->0->>'table'")" devices
 same "$(sql "SELECT index_steward.candidates('SELECT * FROM devices WHERE id=1; SELECT 1')")" '[]'

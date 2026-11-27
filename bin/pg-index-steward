@@ -277,6 +277,12 @@ def upsert_job(db, action, target, signature, detail):
                        SELECT FROM {SCHEMA}.jobs build JOIN {SCHEMA}.verdicts v ON v.job_id=build.id
                        WHERE build.target={target} AND build.signature={literal(signature)}
                          AND v.state='rolled_back' AND v.updated_at>clock_timestamp()-interval '30 days'))
+                   AND ({literal(action)}<>'create' OR NOT EXISTS (
+                       SELECT FROM {SCHEMA}.jobs retired
+                       WHERE retired.action='drop' AND retired.state='done' AND retired.reason='idle'
+                         AND retired.detail->>'name'={literal(detail.get('index'))}
+                         AND retired.detail->>'schema'={literal(detail.get('schema'))}
+                         AND retired.updated_at>clock_timestamp()-interval '7 days'))
                    ON CONFLICT (action,target,signature) WHERE state IN ('queued','running')
                    DO UPDATE SET detail=excluded.detail,evidence_at=clock_timestamp(),updated_at=clock_timestamp()
                    WHERE jobs.state='queued' RETURNING id, created_at=updated_at AS inserted)
@@ -476,9 +482,13 @@ def replica_allows_drop(db, idx, guards, policy):
     return services.issubset({row['service'] for row in rows})
 
 
-def protect(db):
-    return db.one("""SELECT NOT EXISTS (SELECT FROM pg_stat_activity
-                  WHERE pid<>pg_backend_pid() AND xact_start<clock_timestamp()-interval '5 minutes')
+def protect(db, job):
+    target = int(job['target'])
+    return db.one(f"""SELECT NOT EXISTS (SELECT FROM pg_stat_activity a
+                  WHERE a.pid<>pg_backend_pid() AND a.xact_start<clock_timestamp()-interval '5 minutes'
+                    AND (a.backend_xmin IS NOT NULL OR EXISTS (SELECT FROM pg_locks l WHERE l.pid=a.pid
+                        AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
+                        AND l.relation IN ({target},(SELECT indrelid FROM pg_index WHERE indexrelid={target})))))
                   AS no_long_xact,
                   NOT EXISTS (SELECT FROM pg_stat_replication WHERE state<>'streaming'
                     OR COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(),replay_lsn),1e20)>67108864)
@@ -769,7 +779,7 @@ def measure(db, deltas, policy):
                 blocks_new = sum(x['hits'] + x['reads'] for x in selected) / calls
                 strong_regression.append(ratio >= 2 and blocks_old > 0 and blocks_new >= blocks_old * 1.5)
         state = 'observing'
-        if len(results) == len(baseline):
+        if results and len(results) == len(baseline):
             state = 'regression_review' if max(results) > 1.20 else ('improved' if max(results) <= 0.80 else 'mixed')
         db.execute(f"""UPDATE {SCHEMA}.verdicts SET observations={json_value(history[-300:])},
                        state={literal(state)},updated_at=clock_timestamp() WHERE job_id={row['job_id']}""")
@@ -873,7 +883,7 @@ def run_cycle(db, cfg, allow_ddl):
             if not allowed_by_policy(job, policy):
                 defer_job(db, job, 'outside_allowlist', policy)
                 continue
-            guards = protect(db)
+            guards = protect(db, job)
             guards['verified_replicas'] = verified_replicas
             if not guards['no_long_xact'] or not guards['replication_healthy']:
                 reason = 'long_transaction' if not guards['no_long_xact'] else 'replication_lag'

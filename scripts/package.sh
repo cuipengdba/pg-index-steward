@@ -14,6 +14,11 @@ mkdir -p "$bundle/bin" "$bundle/sql" "$out"
 install -m 0755 "$root/install.sh" "$bundle/"
 install -m 0755 "$root/bin/pg-index-steward" "$bundle/bin/"
 install -m 0644 "$root/pg_index_steward.control" "$root/README.md" "$root/LICENSE" "$bundle/"
+for document in CHANGELOG.md ROADMAP.md; do
+    if [[ -f $root/$document ]]; then
+        install -m 0644 "$root/$document" "$bundle/"
+    fi
+done
 if [[ -f $root/vendor/hypopg/LICENSE ]]; then
     install -m 0644 "$root/vendor/hypopg/LICENSE" "$bundle/LICENSE-HypoPG"
 fi
