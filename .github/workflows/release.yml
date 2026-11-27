@@ -43,6 +43,7 @@ jobs:
           sudo bash ./install.sh --files-only --pg-config "$pgconfig"
           bash tests/integration.sh "$pgconfig"
           bash tests/recovery.sh "$pgconfig"
+          bash tests/failover.sh "$pgconfig"
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.platform.arch }}-pg${{ matrix.pg }}
@@ -55,6 +56,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -73,14 +76,28 @@ jobs:
             bash scripts/package.sh "$arch" "stage/$arch"
           done
           (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Sign build provenance
+        id: provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'dist/*.tar.gz'
+      - name: Verify signed build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE" dist/provenance.jsonl
+          for archive in dist/*.tar.gz; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" --bundle dist/provenance.jsonl --deny-self-hosted-runners
+          done
       - name: Publish native-tested release packages
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --clobber
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS dist/provenance.jsonl --clobber
           elif [[ "$GITHUB_REF_NAME" != *-* ]]; then
-            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --verify-tag --title "PG Index Steward ${GITHUB_REF_NAME#v}" --generate-notes
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS dist/provenance.jsonl --verify-tag --latest --title "PG Index Steward ${GITHUB_REF_NAME#v}" --generate-notes
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --verify-tag --generate-notes --prerelease
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS dist/provenance.jsonl --verify-tag --generate-notes --prerelease
           fi

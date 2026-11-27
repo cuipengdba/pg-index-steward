@@ -13,8 +13,8 @@ PG Index Steward 根据 `pg_stat_statements` 的自然流量统计生成索引�
 从 [GitHub Releases](https://github.com/cuipengdba/pg-index-steward/releases) 下载本机架构的 `.tar.gz`。两个架构包各自包含 PG14、15、16、17、18、19 对应的动态库。Linux 预编译包面向 glibc 环境。自定义 PostgreSQL 二进制 ABI、不同 C 库或系统装载失败时，使用目标实例的 `pg_config` 源码编译。PG14 上游维护已结束。
 
 ```bash
-tar -xzf pg-index-steward-1.0.0-linux-x86_64.tar.gz
-cd pg-index-steward-1.0.0-linux-x86_64
+tar -xzf pg-index-steward-2.0.0-linux-x86_64.tar.gz
+cd pg-index-steward-2.0.0-linux-x86_64
 sudo ./install.sh \
   --pg-config /opt/pgsql/bin/pg_config \
   --data-dir /srv/pgsql/data \
@@ -31,7 +31,7 @@ CREATE EXTENSION IF NOT EXISTS pg_index_steward;
 SELECT * FROM index_steward.settings();
 ```
 
-升级已有实例时，先停止执行器并备份数据库和原安装包，再用新安装包的 `--files-only` 更新文件。安排重启 PostgreSQL 加载新动态库，在各目标数据库执行 `ALTER EXTENSION pg_index_steward UPDATE TO '1.0.0';`，核对配置与 `SELECT * FROM index_steward.status();` 后恢复执行器。升级 SQL 从 0.1.0 起逐级保留现有策略和队列。需要回退整个扩展版本时，通过升级前备份恢复扩展的数据库对象，再恢复原安装包。仅替换旧动态库无法回退 SQL 迁移。
+升级已有实例时，先停止执行器并备份数据库和原安装包，再用新安装包的 `--files-only` 更新文件。安排重启 PostgreSQL 加载新动态库，在各目标数据库执行 `ALTER EXTENSION pg_index_steward UPDATE TO '2.0.0';`，核对配置与 `SELECT * FROM index_steward.status();` 后恢复执行器。升级 SQL 从 0.1.0 起逐级保留现有策略和队列。回退整个扩展版本时，使用升级前备份恢复扩展的数据库对象和原安装包。
 
 未使用 systemd 时，可以由已有任务管理器执行以下命令，或去掉 `--once` 作为常驻进程。使用 libpq 原有的本机连接参数或认证文件指定目标。
 
@@ -78,6 +78,8 @@ pg_index_steward.auto_drop_managed = on
 
 HypoPG 1.4.5 的源码随插件编译进 `pg_index_steward.so`。`index_steward.policy.use_hypopg` 默认开启。对部分普通表候选，在执行器连接内以生成的等值模板比较普通 `EXPLAIN` 计划。`detail.plan_evidence` 包含优化器成本与是否使用候选索引。该结果用于理解候选，真实业务效果以建成后的自然流量衡量。
 
+DBA 可在 `index_steward.plan_samples` 登记有代表性的单条 `SELECT` 和绑定值，分别比较通用计划与定制计划，并查看虚拟索引估算体积。仅登记受信任的查询与参数。`index_steward.index_portfolio` 展示候选覆盖的查询数、表写入量及覆盖索引和部分索引建议。`index_steward.relation_hotspots` 按表和查询形态归组规划、执行、I/O 统计和活动会话等待采样。使用外部延迟监控时，可向 `index_steward.latency_samples` 写入按 query ID 聚合的 P95 与样本量。
+
 新索引用自然流量复核。`verdicts` 保留建前与建后的调用次数、总耗时和块指标，输出 `observing`、`improved`、`mixed` 或 `regression_review`。这些指标反映均值趋势。DBA 可调用 `index_steward.approve_rollback(job_id)` 将回退排入维护窗口。`policy.auto_rollback` 默认关闭，启用后也要求持续的耗时和读块回退证据，且仍走索引身份、依赖和复制检查。回退完成后暂停该库的自动队列。
 
 ## 清理规则
@@ -100,10 +102,24 @@ FROM index_steward.jobs WHERE action = 'drop' ORDER BY id DESC;
 ```bash
 pg-index-steward --status --service primary_a --service primary_b
 pg-index-steward --metrics --service primary_a --service primary_b
+pg-index-steward --alerts --service primary_a --service primary_b
 ```
+
+`index_steward.set_paused(true)` 暂停新的数据库变更。`policy.rollout_percent` 控制纳入执行范围的表比例。可用 `index_steward.protect_index('schema.index_name', '2099-12-31')` 为周期任务保留索引。主备切换沿用业务既有的旧主隔离流程，执行器在发现新 WAL 时间线后按 `policy.failover_grace_seconds` 等待，并重新建立闲置观察基线。
+
+`index_steward.table_health` 展示统计新鲜度、死元组比例和可见性估计，`index_steward.extended_statistics_advice` 显示多列统计建议。开启 `policy.auto_analyze` 后，统计刷新可按现有维护窗口和资源规则执行。`index_steward.partition_index_progress` 和 `index_steward.timescale_chunk_index_details` 分别展示原生分区索引进度与 TimescaleDB 分块约束和索引定义。
 
 在 PostgreSQL 的常规日志中搜索 `PG Index Steward`。日志包含结构化事件、数据库名、任务 ID、动作、阻塞原因和重试时间。日志路由遵循 `log_destination` 与 `log_min_messages`，连接失败时执行器在标准错误记录故障。轮询过程中读取 `pg_stat_statements.track=all` 能看到已记录的嵌套语句。规划耗时取自已有的 `track_planning` 统计，未启用时该字段不可用于判断重规划成本。
 
 ## 测试、打包与发布
 
-`tests/integration.sh` 使用独立临时 PGDATA，覆盖升级、安装、建索引、日志、受阻任务恢复、清理、回退与分区任务。`scripts/package.sh` 生成每架构自包含的安装包。GitHub Actions 在原生 x86_64 与 ARM64 runner 上分别验证 PG14–19。已发布功能和更早版本路线见 [CHANGELOG](CHANGELOG.md) 与 [ROADMAP](ROADMAP.md)。
+`tests/integration.sh`、`tests/recovery.sh` 和 `tests/failover.sh` 使用独立临时 PGDATA，覆盖安装、升级、锁冲突恢复、分区任务、主备切换和混合读写。GitHub Actions 在原生 x86_64 与 ARM64 runner 上分别验证 PG14–19。已发布功能和更早版本路线见 [CHANGELOG](CHANGELOG.md) 与 [ROADMAP](ROADMAP.md)。
+
+下载包、`SHA256SUMS` 和 `provenance.jsonl` 后可核对哈希和 GitHub 构建签名。完全离线校验时，在联网环境提前运行 `gh attestation trusted-root > trusted_root.jsonl` 并携带可信根及校验工具。
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify pg-index-steward-2.0.0-linux-x86_64.tar.gz \
+  --repo cuipengdba/pg-index-steward --bundle provenance.jsonl \
+  --custom-trusted-root trusted_root.jsonl
+```
