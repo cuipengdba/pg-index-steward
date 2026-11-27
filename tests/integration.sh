@@ -49,6 +49,12 @@ same "$(PGDATABASE=steward_fresh_install sql "SELECT extversion FROM pg_extensio
 same "$(sql "SELECT auto_create||','||maintenance_window||','||auto_drop_existing||','||auto_drop_managed FROM index_steward.settings()")" 'true,23:00-06:00,false,true'
 same "$(sql "SELECT index_steward.candidates('SELECT * FROM public.devices WHERE id=42')->0->>'table'")" devices
 same "$(sql "SELECT index_steward.candidates('SELECT * FROM devices WHERE id=1; SELECT 1')")" '[]'
+if [[ $(sql "SELECT to_regclass('index_steward.plan_samples') IS NOT NULL") == t ]]; then
+    psql -q <<'SQL'
+INSERT INTO index_steward.plan_samples(table_oid,label,statement,parameters)
+VALUES ('public.devices'::regclass,'point','SELECT * FROM public.devices WHERE id=$1',ARRAY['42']);
+SQL
+fi
 
 sql 'SELECT count(*) FROM public.devices WHERE id=-1' >/dev/null
 worker --observe-only
@@ -71,6 +77,9 @@ if [[ $(sql "SELECT to_regprocedure('index_steward.hypo_reset()') IS NOT NULL") 
     same "$(sql "SELECT detail->'plan_evidence'->>'uses_candidate' FROM index_steward.jobs WHERE action='create'")" true
     same "$(sql "SELECT count(*) FROM pg_extension WHERE extname='hypopg'")" 0
     same "$(sql "SELECT count(*) FROM pg_class WHERE relname LIKE 'pgis_%'")" 0
+    if [[ $(sql "SELECT to_regclass('index_steward.plan_samples') IS NOT NULL") == t ]]; then
+        same "$(sql "SELECT count(*) FROM index_steward.jobs CROSS JOIN LATERAL jsonb_array_elements(detail->'plan_evidence'->'registered_samples') e WHERE e->>'uses_candidate'='true' AND (e->>'estimated_bytes')::bigint>0")" 2
+    fi
 fi
 inside=$(date -u -d '1 hour ago' +%H:%M)-$(date -u -d '1 hour' +%H:%M)
 outside=$(date -u -d '3 hours ago' +%H:%M)-$(date -u -d '2 hours ago' +%H:%M)

@@ -355,6 +355,46 @@ def hypothetical_probe(db, detail):
         db.execute(f"SELECT {SCHEMA}.hypo_reset(); RESET plan_cache_mode; SET statement_timeout='15s'")
 
 
+def measured_plans(db, table_oid, detail):
+    samples = db.rows(f"SELECT label,statement,parameters FROM {SCHEMA}.plan_samples "
+                      f"WHERE table_oid={int(table_oid)} ORDER BY id LIMIT 4")
+    evidence = []
+    for sample in samples:
+        try:
+            db.execute("BEGIN READ ONLY; SET LOCAL statement_timeout='3s'")
+            if not db.one(f"SELECT {SCHEMA}.valid_plan_sample({literal(sample['statement'])}) AS valid")['valid']:
+                continue
+            arguments = ','.join('NULL' if item is None else 'E\'' + item.replace('\\', '\\\\').replace("'", "''") + "'"
+                                 for item in sample['parameters'])
+            invocation = f"steward_sample({arguments})" if arguments else 'steward_sample'
+
+            def plan(mode):
+                db.execute(f"SET LOCAL plan_cache_mode='{mode}'")
+                db.execute('PREPARE steward_sample AS ' + sample['statement'])
+                try:
+                    return json.loads(db.execute(f'EXPLAIN (FORMAT JSON) EXECUTE {invocation}')[0])[0]['Plan']
+                finally:
+                    db.execute('DEALLOCATE steward_sample')
+
+            modes = ('force_generic_plan','force_custom_plan')
+            baseline = {mode: plan(mode) for mode in modes}
+            table = relation(detail['schema'], detail['table'])
+            columns = ','.join(identifier(key) for key in detail['keys'])
+            created = db.one(f"SELECT indexrelid,indexname FROM {SCHEMA}.hypo_create({literal(f'CREATE INDEX ON {table} ({columns})')})")
+            size = db.one(f"SELECT {SCHEMA}.hypo_size({int(created['indexrelid'])}::oid) AS bytes")['bytes']
+            for mode in modes:
+                proposed = plan(mode)
+                evidence.append({'sample': sample['label'], 'mode': mode, 'estimated_bytes': size,
+                    'before_cost': baseline[mode]['Total Cost'], 'after_cost': proposed['Total Cost'],
+                    'before_node': baseline[mode]['Node Type'], 'after_node': proposed['Node Type'],
+                    'uses_candidate': created['indexname'] in json.dumps(proposed)})
+        except DatabaseError as error:
+            evidence.append({'sample': sample['label'], 'error': error.sqlstate or 'unavailable'})
+        finally:
+            db.execute(f"ROLLBACK; DEALLOCATE ALL; SELECT {SCHEMA}.hypo_reset()")
+    return evidence
+
+
 def propose_indexes(db, qstats, deltas, policy):
     proposals = {}
     table_cache = {}
@@ -383,6 +423,9 @@ def propose_indexes(db, qstats, deltas, policy):
     for position, ((target, sig), detail) in enumerate(proposals.items()):
         if policy.get('use_hypopg') and position < 5 and not detail['advisory']:
             detail['plan_evidence'] = hypothetical_probe(db, detail)
+            samples = measured_plans(db, target, detail)
+            if samples:
+                detail['plan_evidence']['registered_samples'] = samples
         upsert_job(db, 'create', target, sig, detail)
 
 

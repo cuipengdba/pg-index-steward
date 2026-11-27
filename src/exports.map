@@ -10,5 +10,9 @@
     pg_finfo_steward_hypo_create;
     steward_hypo_reset;
     pg_finfo_steward_hypo_reset;
+    steward_valid_plan_sample;
+    pg_finfo_steward_valid_plan_sample;
+    hypopg_relation_size;
+    pg_finfo_hypopg_relation_size;
   local: *;
 };

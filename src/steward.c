@@ -16,7 +16,7 @@ extern Datum hypopg_reset(PG_FUNCTION_ARGS);
 static bool steward_hypo_initialized = false;
 
 #if PG_VERSION_NUM >= 190000
-PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "1.2.0");
+PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "1.3.0");
 #else
 PG_MODULE_MAGIC;
 #endif
@@ -316,6 +316,23 @@ steward_log_event(PG_FUNCTION_ARGS)
 }
 
 PG_FUNCTION_INFO_V1(steward_hypo_create);
+PG_FUNCTION_INFO_V1(steward_valid_plan_sample);
+Datum
+steward_valid_plan_sample(PG_FUNCTION_ARGS)
+{
+	List *statements = raw_parser(text_to_cstring(PG_GETARG_TEXT_PP(0)), RAW_PARSE_DEFAULT);
+	Node *node;
+	SelectStmt *stmt;
+	if (list_length(statements) != 1)
+		PG_RETURN_BOOL(false);
+	node = linitial_node(RawStmt, statements)->stmt;
+	if (!IsA(node, SelectStmt))
+		PG_RETURN_BOOL(false);
+	stmt = (SelectStmt *) node;
+	PG_RETURN_BOOL(stmt->withClause == NULL && stmt->intoClause == NULL &&
+				   stmt->lockingClause == NIL && stmt->op == SETOP_NONE);
+}
+
 Datum
 steward_hypo_create(PG_FUNCTION_ARGS)
 {
