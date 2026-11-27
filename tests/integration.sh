@@ -140,8 +140,40 @@ SELECT index_steward.queue_partition_index('public.events', ARRAY['id']::name[])
 SQL
     worker
     same "$(sql "SELECT indisvalid FROM pg_index WHERE indrelid='public.events'::regclass")" f
+    if [[ $(sql "SELECT to_regprocedure('index_steward.retry_job(bigint)') IS NOT NULL") == t ]]; then
+        sql "UPDATE index_steward.jobs SET state='running' WHERE target='public.events'::regclass" >/dev/null
+        worker
+        same "$(sql "SELECT reason FROM index_steward.jobs WHERE target='public.events'::regclass")" interrupted_partition_step
+        sql "UPDATE index_steward.jobs SET next_attempt_at='-infinity' WHERE target='public.events'::regclass" >/dev/null
+    fi
     for _ in {1..5}; do worker; done
     same "$(sql "SELECT indisvalid FROM pg_index WHERE indrelid='public.events'::regclass")" t
     same "$(sql "SELECT state FROM index_steward.jobs WHERE target='public.events'::regclass")" done
+fi
+if [[ $(sql "SELECT to_regprocedure('index_steward.retry_job(bigint)') IS NOT NULL") == t ]]; then
+    sql "INSERT INTO index_steward.jobs (action,target,signature,detail,state,attempts,retry_streak)
+         VALUES('create','public.other'::regclass,'retry-check','{}','failed',12,12)" >/dev/null
+    same "$(sql "SELECT index_steward.retry_job(id) FROM index_steward.jobs WHERE signature='retry-check'")" t
+    same "$(sql "SELECT state||':'||attempts||':'||retry_streak FROM index_steward.jobs WHERE signature='retry-check'")" queued:12:0
+    grep -q 'PG Index Steward .*"reason":"manual_retry"' "$tmp/server.log"
+    sql "DELETE FROM index_steward.jobs WHERE signature='retry-check'" >/dev/null
+    psql -q <<'SQL'
+CREATE TABLE public.backlog (LIKE public.devices);
+INSERT INTO public.backlog SELECT * FROM public.devices;
+ANALYZE public.backlog;
+INSERT INTO index_steward.jobs (action,target,signature,detail) VALUES
+  ('create','public.backlog'::regclass,'large-first',
+   '{"schema":"public","table":"backlog","keys":["id"],"score":99999,"index":"pgis_large_first","samples":[]}'),
+  ('create','public.devices'::regclass,'eligible-second',
+   '{"schema":"public","table":"devices","keys":["id"],"score":999,"index":"pgis_eligible_second","samples":[]}');
+UPDATE index_steward.policy SET allowed_tables=ARRAY['"public"."devices"'];
+SQL
+    worker
+    same "$(sql "SELECT state||':'||reason FROM index_steward.jobs WHERE signature='large-first'")" queued:outside_allowlist
+    same "$(sql "SELECT state FROM index_steward.jobs WHERE signature='eligible-second'")" done
+    sql "UPDATE index_steward.policy SET allowed_tables=NULL;
+         UPDATE index_steward.jobs SET next_attempt_at='-infinity' WHERE signature='large-first'" >/dev/null
+    worker
+    same "$(sql "SELECT state FROM index_steward.jobs WHERE signature='large-first'")" done
 fi
 printf 'Integration passed: %s\n' "$("$pg_config" --version)"

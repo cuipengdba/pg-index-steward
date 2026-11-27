@@ -28,6 +28,7 @@ OBS_MIN_CALLS = 100
 KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
+MIN_DDL_WINDOW_SECONDS = 30
 
 
 class DatabaseError(RuntimeError):
@@ -272,8 +273,12 @@ def upsert_job(db, action, target, signature, detail):
                      AND j.target={target} AND j.signature={literal(signature)}
                      AND ((j.state='failed' AND j.reason='retry_limit') OR
                           (j.state IN ('failed','cancelled') AND j.updated_at>clock_timestamp()-interval '7 days')))
+                   AND ({literal(action)}<>'create' OR NOT EXISTS (
+                       SELECT FROM {SCHEMA}.jobs build JOIN {SCHEMA}.verdicts v ON v.job_id=build.id
+                       WHERE build.target={target} AND build.signature={literal(signature)}
+                         AND v.state='rolled_back' AND v.updated_at>clock_timestamp()-interval '30 days'))
                    ON CONFLICT (action,target,signature) WHERE state IN ('queued','running')
-                   DO UPDATE SET detail=excluded.detail,updated_at=clock_timestamp()
+                   DO UPDATE SET detail=excluded.detail,evidence_at=clock_timestamp(),updated_at=clock_timestamp()
                    WHERE jobs.state='queued' RETURNING id, created_at=updated_at AS inserted)
                    SELECT row_to_json(affected) FROM affected""")
     added = json.loads(rows[0]) if rows else None
@@ -491,6 +496,7 @@ def update_job(db, job, state, message, reason=None):
     db.execute(f"""WITH changed AS (UPDATE {SCHEMA}.jobs SET state={literal(state)},message={literal(message)},
                    reason={literal(reason)},
                    attempts=attempts+CASE WHEN {literal(state)}='running' THEN 1 ELSE 0 END,
+                   retry_streak=retry_streak+CASE WHEN {literal(state)}='running' THEN 1 ELSE 0 END,
                    last_started_at=CASE WHEN {literal(state)}='running' THEN clock_timestamp() ELSE last_started_at END,
                    updated_at=clock_timestamp() WHERE id={job['id']} RETURNING id,attempts)
                    INSERT INTO {SCHEMA}.attempts(job_id,attempt)
@@ -499,13 +505,11 @@ def update_job(db, job, state, message, reason=None):
 
 
 def defer_job(db, job, reason, policy, attempted=False):
-    attempts = job['attempts'] + int(attempted)
-    if attempted and attempts >= policy['retry_limit']:
+    streak = job['retry_streak'] + int(attempted)
+    if attempted and streak >= policy['retry_limit']:
         update_job(db, job, 'failed', f'Retry limit reached ({reason})', 'retry_limit')
         return
-    delay = 0 if reason in ('drop_disabled','create_disabled','outside_allowlist') else min(3600, 120 * (2 ** min(attempts, 5)))
-    if not delay and job['reason'] == reason:
-        return
+    delay = min(3600, 120 * (2 ** min(streak, 5)))
     rows = db.execute(f"""WITH deferred AS (UPDATE {SCHEMA}.jobs SET state='queued',
                    message={literal(reason)},reason={literal(reason)},
                    next_attempt_at=clock_timestamp()+make_interval(secs=>{delay}) WHERE id={job['id']}
@@ -519,12 +523,20 @@ def retryable(error):
 
 def ddl_budget(db, policy, job):
     cfg = settings(db)
-    current = db.one(f"SELECT paused,ddl_timeout_seconds FROM {SCHEMA}.policy WHERE singleton")
+    current = db.one(f"SELECT * FROM {SCHEMA}.policy WHERE singleton")
     seconds = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])
-    if current['paused'] or seconds <= 15 or (job['action'] == 'create' and not cfg['auto_create']):
+    managed = job['detail'].get('managed')
+    drop_enabled = (job['detail'].get('rollback') or
+                    cfg['auto_drop_managed' if managed else 'auto_drop_existing'])
+    enabled = cfg['auto_create'] if job['action'] == 'create' else drop_enabled
+    if (not current or current['paused'] or seconds < MIN_DDL_WINDOW_SECONDS or
+            not enabled or not allowed_by_policy(job, current)):
         defer_job(db, job, 'window_or_policy_changed', policy)
         return 0
-    return min(seconds - 5, current['ddl_timeout_seconds'])
+    # Give a timed-out build another chance with a larger budget, subject to
+    # both the operator's ceiling and the time left in the current window.
+    timeout = min(current['ddl_timeout_seconds'], 1800 * (2 ** min(job['retry_streak'], 3)))
+    return min(seconds - 5, timeout)
 
 
 def fetch_index(db, schema, name, table_oid):
@@ -608,7 +620,8 @@ def partition_step(db, job, cfg, remaining, policy):
     try:
         db.execute(f"SET statement_timeout='{budget}s'")
         db.execute(sql)
-        db.execute(f"UPDATE {SCHEMA}.jobs SET state='queued',reason={literal(stage)},next_attempt_at='-infinity' WHERE id={job['id']}")
+        db.execute(f"UPDATE {SCHEMA}.jobs SET state='queued',reason={literal(stage)},"
+                   f"retry_streak=0,next_attempt_at='-infinity' WHERE id={job['id']}")
         event(db, 'step_completed', job, stage)
     except DatabaseError as error:
         if retryable(error):
@@ -770,9 +783,12 @@ def measure(db, deltas, policy):
 
 def allowed_by_policy(job, policy):
     obj = job['detail']
+    schema, table = obj.get('schema'), obj.get('table')
+    if not isinstance(schema, str) or not isinstance(table, str):
+        return False
     schemas, tables = policy['allowed_schemas'], policy['allowed_tables']
-    return ((schemas is None or obj['schema'] in schemas) and
-            (tables is None or relation(obj['schema'], obj['table']) in tables))
+    return ((schemas is None or schema in schemas) and
+            (tables is None or relation(schema, table) in tables))
 
 
 def recover_jobs(db, policy):
@@ -828,7 +844,9 @@ def run_cycle(db, cfg, allow_ddl):
             return
         cfg = settings(db)
         remaining = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])
-        if remaining <= 15:
+        if remaining < MIN_DDL_WINDOW_SECONDS:
+            if db.one(f"SELECT EXISTS(SELECT FROM {SCHEMA}.jobs WHERE state='queued' AND NOT COALESCE((detail->>'advisory')::boolean,false)) AS pending")['pending']:
+                event(db, 'cycle_waiting', reason='maintenance_window')
             return
         used = db.one(f"SELECT count(*) AS jobs FROM {SCHEMA}.attempts WHERE started_at >= date_trunc('day',clock_timestamp())")
         if used['jobs'] >= policy['daily_limit']:
@@ -837,7 +855,9 @@ def run_cycle(db, cfg, allow_ddl):
         jobs = db.rows(f"""SELECT * FROM {SCHEMA}.jobs WHERE state='queued'
                        AND next_attempt_at<=clock_timestamp()
                        AND NOT COALESCE((detail->>'advisory')::boolean,false)
-                    AND (action<>'create' OR {literal(cfg['auto_create'])})
+                       AND (action<>'create' OR COALESCE((detail->>'partition')::boolean,false)
+                           OR evidence_at>clock_timestamp()-interval '7 days')
+                       AND (action<>'create' OR {literal(cfg['auto_create'])})
                        AND (action<>'drop' OR COALESCE((detail->>'rollback')::boolean,false)
                            OR CASE WHEN COALESCE((detail->>'managed')::boolean,false)
                                    THEN {literal(cfg['auto_drop_managed'])} ELSE {literal(cfg['auto_drop_existing'])} END)
@@ -848,7 +868,7 @@ def run_cycle(db, cfg, allow_ddl):
         for job in jobs:
             cfg = settings(db)
             remaining = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])
-            if remaining <= 15:
+            if remaining < MIN_DDL_WINDOW_SECONDS:
                 return
             if not allowed_by_policy(job, policy):
                 defer_job(db, job, 'outside_allowlist', policy)
