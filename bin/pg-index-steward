@@ -519,12 +519,27 @@ def defer_job(db, job, reason, policy, attempted=False):
     if attempted and streak >= policy['retry_limit']:
         update_job(db, job, 'failed', f'Retry limit reached ({reason})', 'retry_limit')
         return
-    delay = min(3600, 120 * (2 ** min(streak, 5)))
+    base = {'55P03': 30, '40P01': 60, 'disk_headroom': 300, '53100': 300,
+            'replication_lag': 180, '57014': 180}.get(reason, 120)
+    delay = min(3600, base * (2 ** min(streak, 5)))
     rows = db.execute(f"""WITH deferred AS (UPDATE {SCHEMA}.jobs SET state='queued',
                    message={literal(reason)},reason={literal(reason)},
                    next_attempt_at=clock_timestamp()+make_interval(secs=>{delay}) WHERE id={job['id']}
                    RETURNING next_attempt_at::text AS retry_at) SELECT retry_at FROM deferred""")
     event(db, 'deferred', job, reason, rows[0])
+
+
+def reserve_next_window(db, job, cfg):
+    start = cfg['maintenance_window'].split('-')[0]
+    retry = db.execute(f"""WITH timing AS (
+        SELECT current_date + {literal(start)}::time AS boundary, localtimestamp AS current_time
+    ), saved AS (
+        UPDATE {SCHEMA}.jobs SET reason='window_capacity',message='Waiting for enough time in the next window',
+        next_attempt_at=(SELECT (boundary + CASE WHEN boundary<=current_time THEN interval '1 day'
+                             ELSE interval '0' END) AT TIME ZONE current_setting('TimeZone') FROM timing)
+        WHERE id={job['id']} RETURNING next_attempt_at::text
+    ) SELECT next_attempt_at FROM saved""")
+    event(db, 'deferred', job, 'window_capacity', retry[0])
 
 
 def retryable(error):
@@ -535,6 +550,10 @@ def ddl_budget(db, policy, job):
     cfg = settings(db)
     current = db.one(f"SELECT * FROM {SCHEMA}.policy WHERE singleton")
     seconds = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])
+    required = min(job['required_seconds'], current['ddl_timeout_seconds'] + 5) if current else MIN_DDL_WINDOW_SECONDS
+    if 0 < seconds < required:
+        reserve_next_window(db, job, cfg)
+        return 0
     managed = job['detail'].get('managed')
     drop_enabled = (job['detail'].get('rollback') or
                     cfg['auto_drop_managed' if managed else 'auto_drop_existing'])
@@ -556,6 +575,25 @@ def fetch_index(db, schema, name, table_oid):
                 FROM pg_class ic JOIN pg_namespace n ON n.oid=ic.relnamespace
                 JOIN pg_index i ON i.indexrelid=ic.oid
                 WHERE n.nspname={literal(schema)} AND ic.relname={literal(name)} AND i.indrelid={table_oid}""")
+
+
+def repair_build_residue(db, job, index, cfg, policy):
+    marker = job['pending_cleanup']
+    if not marker or not index or index['valid'] or any(index[key] != marker[key] for key in ('oid','fingerprint')):
+        update_job(db, job, 'failed', 'Manual review of index identity required', 'index_name_conflict')
+        return False
+    if not ddl_budget(db, policy, job):
+        return False
+    detail = job['detail']
+    try:
+        db.execute("SET statement_timeout='15s'")
+        db.execute(f"DROP INDEX CONCURRENTLY {relation(detail['schema'],detail['index'])}")
+        db.execute(f"UPDATE {SCHEMA}.jobs SET pending_cleanup=NULL,next_attempt_at='-infinity' WHERE id={job['id']}")
+        event(db, 'cleanup_completed', job, 'owned_invalid_index')
+        return True
+    except DatabaseError as error:
+        defer_job(db, job, error.sqlstate or 'invalid_index_cleanup', policy)
+        return False
 
 
 def partition_children(db, parent):
@@ -662,7 +700,10 @@ def create_index(db, job, cfg, remaining, policy):
     if other['active']:
         defer_job(db, job, 'concurrent_build', policy)
         return False
-    if fetch_index(db, detail['schema'], detail['index'], tbl['oid']):
+    previous = fetch_index(db, detail['schema'], detail['index'], tbl['oid'])
+    if previous:
+        if job['pending_cleanup']:
+            return repair_build_residue(db, job, previous, cfg, policy)
         update_job(db, job, 'failed', 'Generated index already exists; inspect its definition', 'index_name_conflict')
         return False
     qualified = relation(detail['schema'], detail['table'])
@@ -690,14 +731,14 @@ def create_index(db, job, cfg, remaining, policy):
         update_job(db, job, 'done', 'Index valid; observing natural traffic')
     except DatabaseError as exc:
         idx = fetch_index(db, detail['schema'], detail['index'], tbl['oid'])
-        if idx and not idx['valid'] and seconds_remaining(cfg['maintenance_window'], settings(db)['local_time']) > 10:
-            try:
-                db.execute("SET statement_timeout='5s'")
-                db.execute(f"DROP INDEX CONCURRENTLY {relation(detail['schema'],detail['index'])}")
-                idx = None
-            except DatabaseError:
-                event(db, 'cleanup_failed', job, 'invalid_index')
-        if retryable(exc) and not idx:
+        if retryable(exc) and idx and not idx['valid'] and exc.sqlstate in ('55P03','57014','53100'):
+            marker = {name: idx[name] for name in ('oid','fingerprint')}
+            db.execute(f"UPDATE {SCHEMA}.jobs SET pending_cleanup={json_value(marker)} WHERE id={job['id']}")
+            event(db, 'cleanup_queued', job, 'invalid_concurrent_build')
+        if exc.sqlstate == '57014':
+            db.execute(f"UPDATE {SCHEMA}.jobs SET required_seconds=GREATEST(required_seconds,"
+                       f"{min(policy['ddl_timeout_seconds'] + 5, budget * 2 + 5)}) WHERE id={job['id']}")
+        if retryable(exc) and (not idx or not idx['valid']):
             defer_job(db, job, exc.sqlstate, policy, attempted=True)
         else:
             update_job(db, job, 'failed', f'Create failed ({exc.sqlstate or "unknown"})',
@@ -843,6 +884,8 @@ def run_cycle(db, cfg, allow_ddl):
         policy = db.one(f"SELECT * FROM {SCHEMA}.policy WHERE singleton")
         if policy is None:
             raise DatabaseError('Missing index_steward.policy row')
+        if not db.one("SELECT pg_try_advisory_lock(1885825395,176884235) AS held")['held']:
+            return
         recover_jobs(db, policy)
         deltas = workload(db, qstats, info)
         record_diagnostics(db, deltas)
