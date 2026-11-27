@@ -8,9 +8,15 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/json.h"
+#include "utils/lsyscache.h"
+
+extern void steward_hypopg_init(void);
+extern Datum hypopg_create_index(PG_FUNCTION_ARGS);
+extern Datum hypopg_reset(PG_FUNCTION_ARGS);
+static bool steward_hypo_initialized = false;
 
 #if PG_VERSION_NUM >= 190000
-PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.4.0");
+PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.5.0");
 #else
 PG_MODULE_MAGIC;
 #endif
@@ -287,13 +293,14 @@ Datum
 steward_log_event(PG_FUNCTION_ARGS)
 {
 	StringInfoData payload;
+	const char *database = get_database_name(MyDatabaseId);
 	const char *keys[] = {"event", "action", "reason", "retry_at"};
 	const int args[] = {0, 2, 3, 4};
 	int i;
 
 	initStringInfo(&payload);
 	appendStringInfoString(&payload, "{\"database\":");
-	escape_json(&payload, get_database_name(MyDatabaseId));
+	escape_json(&payload, database ? database : "unknown");
 	if (!PG_ARGISNULL(1))
 		appendStringInfo(&payload, ",\"job_id\":" INT64_FORMAT, PG_GETARG_INT64(1));
 	for (i = 0; i < lengthof(args); i++)
@@ -306,4 +313,25 @@ steward_log_event(PG_FUNCTION_ARGS)
 	appendStringInfoChar(&payload, '}');
 	ereport(LOG, (errmsg_internal("PG Index Steward %s", payload.data), errhidestmt(true)));
 	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(steward_hypo_create);
+Datum
+steward_hypo_create(PG_FUNCTION_ARGS)
+{
+	if (!steward_hypo_initialized)
+	{
+		steward_hypopg_init();
+		steward_hypo_initialized = true;
+	}
+	return hypopg_create_index(fcinfo);
+}
+
+PG_FUNCTION_INFO_V1(steward_hypo_reset);
+Datum
+steward_hypo_reset(PG_FUNCTION_ARGS)
+{
+	if (!steward_hypo_initialized)
+		PG_RETURN_VOID();
+	return hypopg_reset(fcinfo);
 }

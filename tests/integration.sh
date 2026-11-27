@@ -58,6 +58,11 @@ sys.argv = [sys.argv[1], '--libpq', sys.argv[2], '--once', '--observe-only']
 raise SystemExit(stub['main']())
 PY
 same "$(sql "SELECT count(*) FROM index_steward.jobs WHERE action='create' AND target='public.devices'::regclass AND detail->'keys'='[\"id\"]'::jsonb")" 1
+if [[ $(sql "SELECT to_regprocedure('index_steward.hypo_reset()') IS NOT NULL") == t ]]; then
+    same "$(sql "SELECT detail->'plan_evidence'->>'uses_candidate' FROM index_steward.jobs WHERE action='create'")" true
+    same "$(sql "SELECT count(*) FROM pg_extension WHERE extname='hypopg'")" 0
+    same "$(sql "SELECT count(*) FROM pg_class WHERE relname LIKE 'pgis_%'")" 0
+fi
 inside=$(date -u -d '1 hour ago' +%H:%M)-$(date -u -d '1 hour' +%H:%M)
 outside=$(date -u -d '3 hours ago' +%H:%M)-$(date -u -d '2 hours ago' +%H:%M)
 setting() { sql "ALTER SYSTEM SET pg_index_steward.$1 = '$2'"; }

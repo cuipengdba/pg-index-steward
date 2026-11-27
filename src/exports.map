@@ -1,0 +1,14 @@
+{
+  global:
+    Pg_magic_func;
+    _PG_init;
+    steward_candidates;
+    pg_finfo_steward_candidates;
+    steward_log_event;
+    pg_finfo_steward_log_event;
+    steward_hypo_create;
+    pg_finfo_steward_hypo_create;
+    steward_hypo_reset;
+    pg_finfo_steward_hypo_reset;
+  local: *;
+};

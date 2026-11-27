@@ -14,6 +14,9 @@ mkdir -p "$bundle/bin" "$bundle/sql" "$out"
 install -m 0755 "$root/install.sh" "$bundle/"
 install -m 0755 "$root/bin/pg-index-steward" "$bundle/bin/"
 install -m 0644 "$root/pg_index_steward.control" "$root/README.md" "$root/LICENSE" "$bundle/"
+if [[ -f $root/vendor/hypopg/LICENSE ]]; then
+    install -m 0644 "$root/vendor/hypopg/LICENSE" "$bundle/LICENSE-HypoPG"
+fi
 install -m 0644 "$root"/sql/pg_index_steward--*.sql "$bundle/sql/"
 for major in {14..19}; do
     mkdir -p "$bundle/payload/$arch/pg$major"

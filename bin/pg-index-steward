@@ -279,7 +279,35 @@ def upsert_job(db, action, target, signature, detail):
         event(db, 'queued', {'id': added['id'], 'action': action}, 'new_candidate')
 
 
-def propose_indexes(db, qstats, deltas):
+def hypothetical_probe(db, detail):
+    """Plan a generated single-table probe in this private backend."""
+    qualified_table = relation(detail['schema'], detail['table'])
+    columns = ', '.join(identifier(key) for key in detail['keys'])
+    terms = ' AND '.join(f'{identifier(key)} = ${number}' for number, key in enumerate(detail['keys'], 1))
+    arguments = ','.join(['NULL'] * len(detail['keys']))
+    explain = f'EXPLAIN (FORMAT JSON) EXECUTE steward_probe({arguments})'
+
+    def plan():
+        db.execute(f'PREPARE steward_probe AS SELECT * FROM {qualified_table} WHERE {terms}')
+        try:
+            return json.loads(db.execute(explain)[0])[0]['Plan']
+        finally:
+            db.execute('DEALLOCATE steward_probe')
+
+    db.execute("SET plan_cache_mode='force_generic_plan'; SET statement_timeout='3s'")
+    try:
+        baseline = plan()
+        created = db.one(f"SELECT indexname FROM {SCHEMA}.hypo_create({literal(f'CREATE INDEX ON {qualified_table} USING btree ({columns})')})")
+        proposed = plan()
+        return {'method': 'generated_generic_equality_probe', 'before_cost': baseline['Total Cost'],
+                'after_cost': proposed['Total Cost'], 'uses_candidate': created['indexname'] in json.dumps(proposed)}
+    except DatabaseError as error:
+        return {'method': 'generated_generic_equality_probe', 'error': error.sqlstate or 'unavailable'}
+    finally:
+        db.execute(f"SELECT {SCHEMA}.hypo_reset(); RESET plan_cache_mode; SET statement_timeout='15s'")
+
+
+def propose_indexes(db, qstats, deltas, policy):
     proposals = {}
     table_cache = {}
     costly = (r for r in deltas if r['calls'] >= MIN_CALLS and r['elapsed'] >= MIN_TOTAL_MS)
@@ -311,7 +339,9 @@ def propose_indexes(db, qstats, deltas):
             detail['advisory'] = detail['advisory'] and item.get('advisory', False)
             detail['score'] += row['elapsed']
             detail['samples'].append({k: row[k] for k in ('userid', 'queryid', 'toplevel', 'calls', 'elapsed', 'reads', 'hits')})
-    for (target, sig), detail in proposals.items():
+    for position, ((target, sig), detail) in enumerate(proposals.items()):
+        if policy.get('use_hypopg') and position < 5 and not detail['advisory']:
+            detail['plan_evidence'] = hypothetical_probe(db, detail)
         upsert_job(db, 'create', target, sig, detail)
 
 
@@ -601,7 +631,7 @@ def run_cycle(db, cfg, allow_ddl):
         recover_jobs(db, policy)
         deltas = workload(db, qstats, info)
         record_diagnostics(db, deltas)
-        propose_indexes(db, qstats, deltas)
+        propose_indexes(db, qstats, deltas, policy)
         observe_indexes(db)
         measure(db, deltas)
         if not allow_ddl or policy['paused']:
