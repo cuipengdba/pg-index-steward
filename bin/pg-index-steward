@@ -288,6 +288,56 @@ def table_keys(db, target, parsed):
     return [x['attname'] for x in keys] if distinct >= 10 else []
 
 
+def rank_portfolio(proposals):
+    """Assign shared workload once per table so overlapping candidates do not dominate."""
+    outstanding = list(proposals.items())
+    ranked = []
+    served = set()
+    while outstanding:
+        def marginal(candidate):
+            (table_oid, _), detail = candidate
+            return sum(sample['elapsed'] for sample in detail['samples']
+                       if (table_oid, sample['userid'], sample['queryid'], sample['toplevel']) not in served)
+
+        best = max(outstanding, key=lambda item: (not item[1]['advisory'], marginal(item),
+                                                  len(item[1]['samples']), -len(item[1]['keys'])))
+        outstanding.remove(best)
+        (table_oid, _), detail = best
+        detail['score'] = marginal(best)
+        if not detail['advisory']:
+            served.update((table_oid, sample['userid'], sample['queryid'], sample['toplevel']) for sample in detail['samples'])
+        ranked.append(best)
+    return ranked
+
+
+def advisory_variants(db, target, detail):
+    qualified = relation(detail['schema'], detail['table'])
+    keys = ', '.join(identifier(key) for key in detail['keys'])
+    create = f'CREATE INDEX CONCURRENTLY ON {qualified} ({keys})'
+    variants = []
+    # Explicit registered projections can justify a covering alternative. Only
+    # selected, short scalar columns are considered, and the variant is advisory.
+    for row in db.rows(f"""SELECT a.attname FROM pg_attribute a
+          WHERE a.attrelid={int(target)} AND a.attnum>0 AND NOT a.attisdropped
+            AND a.attlen BETWEEN 1 AND 8
+            AND EXISTS(SELECT FROM {SCHEMA}.plan_samples p WHERE p.table_oid=a.attrelid
+              AND substring(p.statement FROM '(?i)^\\s*select\\s+([a-z_][a-z0-9_]*)\\s+from\\s+')=a.attname)
+          ORDER BY a.attnum LIMIT 4"""):
+        col = row['attname']
+        if col not in detail['keys']:
+            variants.append({'include': [col], 'ddl_preview': f'{create} INCLUDE ({identifier(col)})'})
+            break
+    # Non-null partial indexes can serve strict equality/range predicates.
+    # A substantial null fraction is required before recommending the variant.
+    col = detail['keys'][0]
+    stats = db.one(f"""SELECT null_frac FROM pg_stats WHERE schemaname={literal(detail['schema'])}
+               AND tablename={literal(detail['table'])} AND attname={literal(col)} AND NOT inherited""")
+    if stats and stats['null_frac'] >= .3:
+        predicate = f'{identifier(col)} IS NOT NULL'
+        variants.append({'predicate': predicate, 'ddl_preview': f'{create} WHERE {predicate}'})
+    return create, variants
+
+
 def covered(db, table_oid, keys):
     key_sql = ','.join(literal(key) for key in keys)
     return db.one(f"""SELECT EXISTS(
@@ -297,7 +347,9 @@ def covered(db, table_oid, keys):
                   AND am.amname='btree' AND i.indpred IS NULL AND i.indnkeyatts >= {len(keys)}
                   AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(attnum, pos)
                             LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
-                            WHERE k.pos <= {len(keys)} ORDER BY k.pos)=ARRAY[{key_sql}]::text[]
+                            JOIN pg_opclass op ON op.oid=i.indclass[k.pos::int-1] AND op.opcdefault
+                            WHERE k.pos <= {len(keys)} AND i.indcollation[k.pos::int-1]=a.attcollation
+                            ORDER BY k.pos)=ARRAY[{key_sql}]::text[]
               ) AS covered""")['covered']
 
 
@@ -419,13 +471,24 @@ def propose_indexes(db, qstats, deltas, policy):
                                          estimated_table_bytes=target['bytes']))
             detail['advisory'] = detail['advisory'] and item.get('advisory', False)
             detail['score'] += row['elapsed']
-            detail['samples'].append({k: row[k] for k in ('userid', 'queryid', 'toplevel', 'calls', 'elapsed', 'reads', 'hits')})
-    for position, ((target, sig), detail) in enumerate(proposals.items()):
+            sample = {k: row[k] for k in ('userid', 'queryid', 'toplevel', 'calls', 'elapsed', 'reads', 'hits')}
+            if sample not in detail['samples']:
+                detail['samples'].append(sample)
+    for position, ((target, sig), detail) in enumerate(rank_portfolio(proposals)):
+        profile = db.one(f"""SELECT n_tup_ins,n_tup_upd,n_tup_del,n_tup_hot_upd
+                         FROM pg_stat_user_tables WHERE relid={int(target)}""")
+        detail['write_profile'] = profile
         if policy.get('use_hypopg') and position < 5 and not detail['advisory']:
             detail['plan_evidence'] = hypothetical_probe(db, detail)
             samples = measured_plans(db, target, detail)
             if samples:
                 detail['plan_evidence']['registered_samples'] = samples
+        if position < 10 and not detail['advisory']:
+            detail['ddl_preview'], variants = advisory_variants(db, target, detail)
+            for variant in variants:
+                name = 'include' if 'include' in variant else 'partial'
+                option = {**detail, **variant, 'advisory': True, 'plan_evidence': None}
+                upsert_job(db, 'create', target, sig + ':' + name, option)
         upsert_job(db, 'create', target, sig, detail)
 
 
