@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""Collect PostgreSQL statistics and run a bounded index-maintenance cycle."""
+
+import argparse
+import ctypes
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+from itertools import islice
+from pathlib import Path
+
+
+SCHEMA = 'index_steward'
+MAX_STATEMENTS = 300
+MIN_CALLS = 20
+MIN_TOTAL_MS = 1000
+MIN_TABLE_BYTES = 1024 * 1024
+MIN_ROWS = 1000
+IDLE_DAYS = 60
+MAX_GAP_HOURS = 24
+OBS_MIN_CALLS = 100
+KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
+             1114, 1184, 1186, 1266, 1700, 2950, 3220}
+MIB = 1024 * 1024
+
+
+class DatabaseError(RuntimeError):
+    pass
+
+
+def literal(value):
+    if value is None:
+        return 'NULL'
+    if isinstance(value, bool):
+        return 'TRUE' if value else 'FALSE'
+    if isinstance(value, int):
+        return str(value)
+    return "pg_catalog.convert_from(pg_catalog.decode('%s','hex'),'UTF8')" % str(value).encode().hex()
+
+
+def json_value(value):
+    return literal(json.dumps(value, ensure_ascii=True, allow_nan=False)) + '::jsonb'
+
+
+def identifier(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def relation(schema, name):
+    return identifier(schema) + '.' + identifier(name)
+
+
+class Database:
+    def __init__(self, library, conninfo):
+        self.lib = ctypes.CDLL(str(library))
+        signatures = {
+            'PQconnectdb': (ctypes.c_void_p, (ctypes.c_char_p,)),
+            'PQstatus': (ctypes.c_int, (ctypes.c_void_p,)),
+            'PQsetClientEncoding': (ctypes.c_int, (ctypes.c_void_p, ctypes.c_char_p)),
+            'PQerrorMessage': (ctypes.c_char_p, (ctypes.c_void_p,)),
+            'PQfinish': (None, (ctypes.c_void_p,)),
+            'PQexec': (ctypes.c_void_p, (ctypes.c_void_p, ctypes.c_char_p)),
+            'PQresultStatus': (ctypes.c_int, (ctypes.c_void_p,)),
+            'PQntuples': (ctypes.c_int, (ctypes.c_void_p,)),
+            'PQgetvalue': (ctypes.c_char_p, (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)),
+            'PQclear': (None, (ctypes.c_void_p,)),
+        }
+        for name, (result, arguments) in signatures.items():
+            fn = getattr(self.lib, name)
+            fn.restype, fn.argtypes = result, arguments
+        self.conn = self.lib.PQconnectdb(conninfo.encode())
+        if not self.conn:
+            raise DatabaseError('libpq could not allocate a connection')
+        if self.lib.PQstatus(self.conn) or self.lib.PQsetClientEncoding(self.conn, b'UTF8'):
+            error = self.error()
+            self.close()
+            raise DatabaseError(error)
+        self.execute("SET search_path = pg_catalog; SET application_name = 'pg-index-steward'; "
+                     "SET statement_timeout = '15s'; SET lock_timeout = '2s'")
+
+    def error(self):
+        return self.lib.PQerrorMessage(self.conn).decode(errors='replace').strip()
+
+    def close(self):
+        self.lib.PQfinish(self.conn)
+
+    def execute(self, sql):
+        result = self.lib.PQexec(self.conn, sql.encode())
+        if not result:
+            raise DatabaseError(self.error())
+        try:
+            if self.lib.PQresultStatus(result) not in (1, 2):
+                raise DatabaseError(self.error())
+            return [self.lib.PQgetvalue(result, row, 0).decode()
+                    for row in range(self.lib.PQntuples(result))]
+        finally:
+            self.lib.PQclear(result)
+
+    def rows(self, sql):
+        return [json.loads(row) for row in self.execute(f'SELECT row_to_json(r) FROM ({sql}) r')]
+
+    def one(self, sql):
+        rows = self.rows(sql)
+        return rows[0] if rows else None
+
+
+def settings(db):
+    return db.one(f"""SELECT s.*, current_setting('data_directory') AS data_directory,
+                         EXTRACT(epoch FROM clock_timestamp())::float8 AS now_epoch,
+                         to_char(clock_timestamp(),'HH24:MI:SS') AS local_time,
+                         pg_is_in_recovery() AS recovery,
+                         current_setting('transaction_read_only') = 'on' AS read_only
+                  FROM {SCHEMA}.settings() s""")
+
+
+def seconds_remaining(window, clock):
+    def seconds(value):
+        h, m, *s = map(int, value.split(':'))
+        return h * 3600 + m * 60 + (s[0] if s else 0)
+
+    start, end = map(seconds, window.split('-'))
+    now = seconds(clock)
+    if start < end and start <= now < end:
+        return end - now
+    if end < start and now >= start:
+        return 86400 - now + end
+    if end < start and now < end:
+        return end - now
+    return 0
+
+
+def extension_locations(db):
+    row = db.one("""SELECT n.nspname AS ns FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace
+                    WHERE e.extname='pg_stat_statements'""")
+    return relation(row['ns'], 'pg_stat_statements'), relation(row['ns'], 'pg_stat_statements_info')
+
+
+def usage_counters(db, qstats, info):
+    return db.rows(f"""SELECT s.userid, s.queryid, s.toplevel, s.calls,
+                              s.total_exec_time AS elapsed, s.shared_blks_read AS reads,
+                              s.shared_blks_hit AS hits, s.temp_blks_written AS temporary,
+                              i.stats_reset::text AS reset_marker, i.dealloc AS dealloc,
+                              to_jsonb(s)->>'stats_since' AS stats_since,
+                              old.snapshot AS previous
+                       FROM {qstats} s CROSS JOIN {info} i
+                       LEFT JOIN {SCHEMA}.workload old USING (userid,queryid,toplevel)
+                       WHERE s.dbid=(SELECT oid FROM pg_database WHERE datname=current_database())
+                         AND s.queryid IS NOT NULL AND s.calls > 0
+                       ORDER BY s.total_exec_time - CASE
+                           WHEN old.snapshot->>'reset_marker' = i.stats_reset::text
+                            AND s.total_exec_time >= (old.snapshot->>'elapsed')::float8
+                           THEN (old.snapshot->>'elapsed')::float8 ELSE 0 END DESC
+                       LIMIT {MAX_STATEMENTS}""")
+
+
+def workload(db, qstats, info):
+    changes = []
+    snapshots = []
+    for row in usage_counters(db, qstats, info):
+        old = row.pop('previous')
+        snapshots.append((row['userid'], row['queryid'], row['toplevel'], row))
+        if not old or any(old[k] != row[k] for k in ('reset_marker', 'dealloc', 'stats_since')):
+            continue
+        counters = ('calls', 'elapsed', 'reads', 'hits', 'temporary')
+        delta = {k: row[k] - old[k] for k in counters}
+        if delta['calls'] > 0 and min(delta.values()) >= 0:
+            changes.append({**row, **delta})
+    if snapshots:
+        values = ','.join(f'({u}::oid,{q}::bigint,{literal(top)},{json_value(v)})' for u, q, top, v in snapshots)
+        db.execute(f"""INSERT INTO {SCHEMA}.workload VALUES {values}
+                        ON CONFLICT (userid,queryid,toplevel) DO UPDATE SET snapshot=excluded.snapshot""")
+    return sorted(changes, key=lambda x: x['elapsed'], reverse=True)
+
+
+def eligible_table(db, schema, name):
+    target = db.one(f"""SELECT c.oid, c.relname, n.nspname, c.reltuples, pg_relation_size(c.oid) AS bytes,
+                            c.relpages
+                     FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                     WHERE n.nspname={literal(schema)} AND c.relname={literal(name)}
+                       AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition
+                       AND c.reltablespace=0 AND NOT c.relrowsecurity
+                       AND n.nspname NOT IN ('information_schema','{SCHEMA}') AND n.nspname !~ '^pg_'
+                       AND NOT EXISTS (SELECT FROM pg_inherits h WHERE h.inhparent=c.oid OR h.inhrelid=c.oid)
+                       AND NOT EXISTS (SELECT FROM pg_depend d WHERE d.classid='pg_class'::regclass
+                                       AND d.objid=c.oid AND d.deptype='e')""")
+    if target and not extension_managed(db, target['oid'], schema, name):
+        return target
+    return None
+
+
+def extension_managed(db, oid, schema, name):
+    extensions = db.one("""SELECT EXISTS(SELECT FROM pg_extension WHERE extname='citus') AS citus,
+                                  EXISTS(SELECT FROM pg_extension WHERE extname='timescaledb') AS timescale""")
+    if extensions['citus'] and db.one(f"SELECT EXISTS(SELECT FROM pg_catalog.pg_dist_partition WHERE logicalrelid={oid}) AS hit")['hit']:
+        return True
+    return extensions['timescale'] and db.one(f"""SELECT EXISTS(SELECT FROM timescaledb_information.hypertables
+         WHERE hypertable_schema={literal(schema)} AND hypertable_name={literal(name)}) AS hit""")['hit']
+
+
+def table_keys(db, target, parsed):
+    rows = db.rows(f"""SELECT a.attname, a.attnum, a.atttypid::bigint AS atttypid, COALESCE(s.n_distinct,0) AS nd,
+                              COALESCE(s.null_frac,0) AS null_fraction
+                       FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+                       JOIN pg_namespace n ON n.oid=c.relnamespace
+                       LEFT JOIN pg_stats s ON s.schemaname=n.nspname AND s.tablename=c.relname
+                                            AND s.attname=a.attname AND NOT s.inherited
+                       WHERE a.attrelid={target['oid']} AND a.attnum>0 AND NOT a.attisdropped""")
+    found = {r['attname']: r for r in rows if r['atttypid'] in KEY_TYPES and r['nd'] != 0}
+    eq = [found[col] for col in parsed['eq'] if col in found]
+    eq.sort(key=lambda x: (-(x['nd'] if x['nd'] > 0 else -x['nd'] * target['reltuples']), x['attnum']))
+    keys = eq[:2]
+    ranged = found.get(parsed['range'])
+    if ranged and ranged not in keys:
+        keys.append(ranged)
+    if not keys:
+        return []
+    distinct = max((x['nd'] if x['nd'] > 0 else -x['nd'] * target['reltuples']) for x in keys)
+    return [x['attname'] for x in keys] if distinct >= 10 else []
+
+
+def covered(db, table_oid, keys):
+    key_sql = ','.join(literal(key) for key in keys)
+    return db.one(f"""SELECT EXISTS(
+                SELECT FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+                JOIN pg_am am ON am.oid=c.relam
+                WHERE i.indrelid={table_oid} AND i.indisvalid AND i.indislive
+                  AND am.amname='btree' AND i.indpred IS NULL AND i.indnkeyatts >= {len(keys)}
+                  AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(attnum, pos)
+                            LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+                            WHERE k.pos <= {len(keys)} ORDER BY k.pos)=ARRAY[{key_sql}]::text[]
+              ) AS covered""")['covered']
+
+
+def upsert_job(db, action, target, signature, detail):
+    db.execute(f"""INSERT INTO {SCHEMA}.jobs(action,target,signature,detail)
+                   SELECT {literal(action)},{target},{literal(signature)},{json_value(detail)}
+                   WHERE NOT EXISTS (SELECT FROM {SCHEMA}.jobs j WHERE j.action={literal(action)}
+                     AND j.target={target} AND j.signature={literal(signature)}
+                     AND j.state IN ('failed','cancelled') AND j.updated_at>clock_timestamp()-interval '7 days')
+                   ON CONFLICT (action,target,signature) WHERE state IN ('queued','running')
+                   DO UPDATE SET detail=excluded.detail,updated_at=clock_timestamp()
+                   WHERE jobs.state='queued'""")
+
+
+def propose_indexes(db, qstats, deltas):
+    proposals = {}
+    table_cache = {}
+    costly = (r for r in deltas if r['calls'] >= MIN_CALLS and r['elapsed'] >= MIN_TOTAL_MS)
+    for row in islice(costly, 30):
+        try:
+            parsed = db.one(f"""SELECT {SCHEMA}.candidates(query) AS candidates FROM {qstats}
+                  WHERE userid={row['userid']} AND queryid={row['queryid']}
+                    AND dbid=(SELECT oid FROM pg_database WHERE datname=current_database())
+                    AND toplevel={literal(row['toplevel'])} AND query IS NOT NULL""")
+        except DatabaseError:
+            continue  # A normalized statement can be truncated or unparsable.
+        for item in parsed['candidates'] if parsed else []:
+            pair = item['schema'], item['table']
+            if pair not in table_cache:
+                table_cache[pair] = eligible_table(db, *pair)
+            target = table_cache[pair]
+            if not target or target['bytes'] < MIN_TABLE_BYTES or target['reltuples'] < MIN_ROWS:
+                continue
+            # Prefer queries that revisit a meaningful share of their table over the sample.
+            if row['reads'] + row['hits'] < max(1000, target['relpages'] * 2):
+                continue
+            keys = table_keys(db, target, item)
+            if not keys or covered(db, target['oid'], keys):
+                continue
+            sig = hashlib.sha256(json.dumps([*pair, keys], ensure_ascii=False).encode()).hexdigest()[:24]
+            detail = proposals.setdefault((target['oid'], sig), dict(schema=pair[0], table=pair[1], keys=keys,
+                                         index='pgis_' + sig, score=0, samples=[]))
+            detail['score'] += row['elapsed']
+            detail['samples'].append({k: row[k] for k in ('userid', 'queryid', 'toplevel', 'calls', 'elapsed', 'reads', 'hits')})
+    for (target, sig), detail in proposals.items():
+        upsert_job(db, 'create', target, sig, detail)
+
+
+def index_inventory(db, index_oid=None):
+    return db.rows(f"""SELECT s.indexrelid AS oid, s.relid AS table_oid, s.schemaname AS schema,
+                         s.relname AS table, s.indexrelname AS name, s.idx_scan AS scans,
+                         pg_relation_size(s.indexrelid) AS bytes, pg_get_indexdef(s.indexrelid) AS ddl,
+                         md5(concat_ws('|',pg_get_indexdef(s.indexrelid),ic.relfilenode::text,
+                             s.relid::text)) AS fingerprint,
+                         concat_ws('|',d.stats_reset::text,pg_postmaster_start_time()::text,
+                                   to_jsonb(s)->>'stats_reset') AS reset_marker,
+                         m.index_oid IS NOT NULL AND m.retired_at IS NULL AND
+                           m.fingerprint=md5(concat_ws('|',pg_get_indexdef(s.indexrelid),
+                                  ic.relfilenode::text,s.relid::text)) AS managed,
+                         old.scans AS prior_scans, old.fingerprint AS prior_fingerprint,
+                         old.reset_marker AS prior_reset, old.idle_since::text,
+                         old.observed_at > clock_timestamp()-interval '{MAX_GAP_HOURS} hours' AS recent,
+                         old.idle_since <= clock_timestamp()-interval '{IDLE_DAYS} days' AS idle_long,
+                         i.indisvalid AND i.indisready AND i.indislive AS valid
+                    FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid=s.indexrelid
+                    JOIN pg_class ic ON ic.oid=i.indexrelid JOIN pg_class tc ON tc.oid=i.indrelid
+                    JOIN pg_am am ON am.oid=ic.relam
+                    JOIN pg_stat_database d ON d.datname=current_database()
+                    LEFT JOIN {SCHEMA}.index_usage old ON old.index_oid=s.indexrelid
+                    LEFT JOIN {SCHEMA}.managed_indexes m ON m.index_oid=s.indexrelid
+                    WHERE tc.relkind='r' AND tc.relpersistence='p' AND NOT tc.relispartition
+                      AND NOT tc.relrowsecurity AND ic.relkind='i' AND am.amname='btree'
+                      AND NOT (i.indisunique OR i.indisprimary OR i.indisexclusion OR i.indisreplident OR i.indisclustered)
+                      AND i.indpred IS NULL AND i.indexprs IS NULL
+                      AND s.schemaname NOT IN ('information_schema','{SCHEMA}') AND s.schemaname !~ '^pg_'
+                      AND NOT EXISTS (SELECT FROM pg_inherits h WHERE h.inhparent=s.relid OR h.inhrelid=s.relid)
+                      AND NOT EXISTS (SELECT FROM pg_constraint co WHERE co.conindid=s.indexrelid)
+                      AND NOT EXISTS (SELECT FROM pg_constraint fk WHERE fk.contype='f' AND fk.conrelid=s.relid
+                          AND cardinality(fk.conkey) <= i.indnkeyatts AND fk.conkey <@ ARRAY(
+                             SELECT key FROM unnest(i.indkey) WITH ORDINALITY k(key,pos)
+                             WHERE k.pos <= cardinality(fk.conkey)))
+                      AND NOT EXISTS (SELECT FROM pg_depend pd WHERE
+                         (pd.classid='pg_class'::regclass AND pd.objid IN (s.relid,s.indexrelid) AND pd.deptype='e') OR
+                         (pd.refclassid='pg_class'::regclass AND pd.refobjid=s.indexrelid))
+                      {f'AND s.indexrelid={index_oid}' if index_oid is not None else ''}""")
+
+
+def continuously_idle(idx):
+    return (idx['recent'] and idx['scans'] == idx['prior_scans'] and
+            idx['fingerprint'] == idx['prior_fingerprint'] and idx['reset_marker'] == idx['prior_reset'])
+
+
+def observe_indexes(db):
+    batch = []
+    for idx in index_inventory(db):
+        if not idx['valid']:
+            continue
+        idle = continuously_idle(idx)
+        since = literal(idx['idle_since']) + '::timestamptz' if idle else 'clock_timestamp()'
+        batch.append(f"({idx['oid']},{literal(idx['fingerprint'])},{idx['scans']},clock_timestamp(),"
+                     f"{since},{literal(idx['reset_marker'])})")
+        if idle and idx['idle_long']:
+            upsert_job(db, 'drop', idx['oid'], idx['fingerprint'],
+                       {k: idx[k] for k in ('schema', 'table', 'name', 'ddl', 'bytes', 'scans', 'managed', 'idle_since')})
+    for start in range(0, len(batch), 200):
+        values = ','.join(batch[start:start + 200])
+        db.execute(f"""INSERT INTO {SCHEMA}.index_usage VALUES {values}
+                    ON CONFLICT(index_oid) DO UPDATE SET fingerprint=excluded.fingerprint,
+                    scans=excluded.scans, observed_at=excluded.observed_at,
+                    idle_since=excluded.idle_since, reset_marker=excluded.reset_marker""")
+
+
+def protect(db):
+    return db.one("""SELECT NOT EXISTS (SELECT FROM pg_stat_activity
+                  WHERE pid<>pg_backend_pid() AND xact_start<clock_timestamp()-interval '5 minutes')
+                  AS no_long_xact,
+                  NOT EXISTS (SELECT FROM pg_stat_replication WHERE state<>'streaming'
+                    OR COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(),replay_lsn),1e20)>67108864)
+                  AS replication_healthy,
+                  NOT EXISTS (SELECT FROM pg_stat_replication) AND
+                  NOT EXISTS (SELECT FROM pg_replication_slots) AS no_replica_evidence""")
+
+
+def update_job(db, job, state, message):
+    db.execute(f"""UPDATE {SCHEMA}.jobs SET state={literal(state)},message={literal(message)},
+                   updated_at=clock_timestamp() WHERE id={job['id']}""")
+
+
+def fetch_index(db, schema, name, table_oid):
+    return db.one(f"""SELECT ic.oid, i.indisvalid AS valid, i.indisready AS ready,
+                     pg_get_indexdef(ic.oid) AS ddl,
+                     md5(concat_ws('|',pg_get_indexdef(ic.oid),ic.relfilenode::text,i.indrelid::text)) AS fingerprint
+                FROM pg_class ic JOIN pg_namespace n ON n.oid=ic.relnamespace
+                JOIN pg_index i ON i.indexrelid=ic.oid
+                WHERE n.nspname={literal(schema)} AND ic.relname={literal(name)} AND i.indrelid={table_oid}""")
+
+
+def create_index(db, job, cfg, remaining):
+    detail = job['detail']
+    tbl = eligible_table(db, detail['schema'], detail['table'])
+    if not tbl or tbl['oid'] != job['target'] or covered(db, tbl['oid'], detail['keys']):
+        update_job(db, job, 'cancelled', 'Table changed or an index now covers the candidate')
+        return False
+    if tbl['bytes'] < MIN_TABLE_BYTES or tbl['reltuples'] < MIN_ROWS or tbl['bytes'] > 5 * 1024 * MIB:
+        return False
+    reserve = max(1024 * MIB, 2 * tbl['bytes'])
+    if shutil.disk_usage(cfg['data_directory']).free < reserve:
+        return False
+    other = db.one(f"""SELECT EXISTS(SELECT FROM pg_stat_progress_create_index WHERE relid={tbl['oid']}) AS active""")
+    if other['active'] or fetch_index(db, detail['schema'], detail['index'], tbl['oid']):
+        update_job(db, job, 'cancelled', 'An index build is active or the generated index name already exists')
+        return False
+    qualified = relation(detail['schema'], detail['table'])
+    columns = ', '.join(identifier(x) for x in detail['keys'])
+    ddl = f"CREATE INDEX CONCURRENTLY {identifier(detail['index'])} ON {qualified} USING btree ({columns})"
+    update_job(db, job, 'running', 'Concurrent create started')
+    try:
+        db.execute(f"SET statement_timeout='{min(remaining - 5, 1800)}s'")
+        db.execute(ddl)
+        idx = fetch_index(db, detail['schema'], detail['index'], tbl['oid'])
+        if not idx or not idx['valid'] or not idx['ready']:
+            raise DatabaseError('Expected valid index missing after DDL')
+        db.execute(f"""WITH managed AS (
+                        INSERT INTO {SCHEMA}.managed_indexes(index_oid,table_oid,fingerprint,ddl,build_job)
+                        VALUES ({idx['oid']},{tbl['oid']},{literal(idx['fingerprint'])},{literal(idx['ddl'])},{job['id']})
+                        RETURNING index_oid)
+                        INSERT INTO {SCHEMA}.verdicts(job_id,index_oid,index_fingerprint,baseline)
+                        SELECT {job['id']}, index_oid,{literal(idx['fingerprint'])},{json_value(detail['samples'])} FROM managed""")
+        update_job(db, job, 'done', 'Index valid; observing natural traffic')
+    except DatabaseError as exc:
+        idx = fetch_index(db, detail['schema'], detail['index'], tbl['oid'])
+        if idx and not idx['valid'] and seconds_remaining(cfg['maintenance_window'], settings(db)['local_time']) > 10:
+            try:
+                db.execute("SET statement_timeout='5s'")
+                db.execute(f"DROP INDEX CONCURRENTLY {relation(detail['schema'],detail['index'])}")
+            except DatabaseError:
+                pass  # The failed job retains the object name for operator follow-up.
+        update_job(db, job, 'failed', str(exc)[:1000])
+    finally:
+        db.execute("SET statement_timeout='15s'")
+    return True
+
+
+def drop_index(db, job, cfg, guards, remaining):
+    rows = index_inventory(db, job['target'])
+    if not rows or rows[0]['fingerprint'] != job['signature']:
+        update_job(db, job, 'cancelled', 'Index identity or dependencies changed')
+        return False
+    idx = rows[0]
+    if extension_managed(db, idx['table_oid'], idx['schema'], idx['table']):
+        update_job(db, job, 'cancelled', 'Table is managed by another extension')
+        return False
+    permitted = cfg['auto_drop_managed'] if idx['managed'] else cfg['auto_drop_existing']
+    if not permitted or not guards['no_replica_evidence']:
+        return False
+    if not idx['valid'] or not continuously_idle(idx) or not idx['idle_long']:
+        update_job(db, job, 'cancelled', 'Idle evidence no longer qualifies')
+        return False
+    # Persist recreatable DDL before executing the nontransactional operation.
+    update_job(db, job, 'running', 'Concurrent drop started')
+    try:
+        db.execute(f"SET statement_timeout='{min(remaining - 5, 1800)}s'")
+        db.execute(f"DROP INDEX CONCURRENTLY {relation(idx['schema'],idx['name'])}")
+        db.execute(f"""UPDATE {SCHEMA}.managed_indexes SET retired_at=clock_timestamp()
+                       WHERE index_oid={idx['oid']} AND fingerprint={literal(idx['fingerprint'])}""")
+        update_job(db, job, 'done', 'Index retired; original DDL retained in detail')
+    except DatabaseError as exc:
+        update_job(db, job, 'failed', str(exc)[:1000])
+    finally:
+        db.execute("SET statement_timeout='15s'")
+    return True
+
+
+def measure(db, deltas):
+    lookup = {(x['userid'], x['queryid'], x['toplevel']): x for x in deltas}
+    for row in db.rows(f"SELECT * FROM {SCHEMA}.verdicts WHERE state='observing' ORDER BY job_id LIMIT 30"):
+        baseline = row['baseline']
+        history = row['observations']
+        for item in baseline:
+            k = item['userid'], item['queryid'], item['toplevel']
+            sample = lookup.get(k)
+            if sample:
+                history.append({name: sample[name] for name in ('userid','queryid','toplevel','calls','elapsed','reads','hits')})
+        if not history:
+            continue
+        results = []
+        for item in baseline:
+            selected = [x for x in history if all(x[key] == item[key] for key in ('userid','queryid','toplevel'))]
+            calls = sum(x['calls'] for x in selected)
+            if calls >= OBS_MIN_CALLS and len(selected) >= 3:
+                observed = sum(x['elapsed'] for x in selected) / calls
+                original = item['elapsed'] / item['calls']
+                results.append(observed / original)
+        state = 'observing'
+        if len(results) == len(baseline):
+            state = 'regression_review' if max(results) > 1.20 else ('improved' if max(results) <= 0.80 else 'mixed')
+        db.execute(f"""UPDATE {SCHEMA}.verdicts SET observations={json_value(history[-300:])},
+                       state={literal(state)},updated_at=clock_timestamp() WHERE job_id={row['job_id']}""")
+
+
+def run_cycle(db, cfg, allow_ddl):
+    if cfg['recovery'] or cfg['read_only']:
+        return
+    datadir = Path(cfg['data_directory'])
+    if not (datadir / 'PG_VERSION').is_file():
+        raise DatabaseError('Use the runner on the PostgreSQL host with its data directory mounted')
+    with (datadir / '.pg-index-steward.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        qstats, info = extension_locations(db)
+        db.execute(f"""UPDATE {SCHEMA}.jobs SET state='failed',message='Interrupted; inspect catalog before retry',
+                         updated_at=clock_timestamp() WHERE state='running'""")
+        deltas = workload(db, qstats, info)
+        propose_indexes(db, qstats, deltas)
+        observe_indexes(db)
+        measure(db, deltas)
+        if not allow_ddl:
+            return
+        cfg = settings(db)
+        remaining = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])
+        if remaining <= 15:
+            return
+        guards = protect(db)
+        if not guards['no_long_xact'] or not guards['replication_healthy']:
+            return
+        jobs = db.rows(f"""SELECT * FROM {SCHEMA}.jobs WHERE state='queued'
+                       AND updated_at>clock_timestamp()-interval '24 hours'
+                       ORDER BY action='create' DESC, COALESCE((detail->>'score')::float8, 0) DESC,id LIMIT 50""")
+        for job in jobs:
+            cfg = settings(db)
+            remaining = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])
+            if remaining <= 15:
+                return
+            if job['action'] == 'create' and cfg['auto_create']:
+                if create_index(db, job, cfg, remaining):
+                    return
+            elif job['action'] == 'drop':
+                if drop_index(db, job, cfg, guards, remaining):
+                    return
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--libpq', default=os.environ.get('PGSTEWARD_LIBPQ', 'libpq.so.5'))
+    parser.add_argument('--conninfo', default='')
+    parser.add_argument('--interval', type=int, default=900)
+    parser.add_argument('--once', action='store_true')
+    parser.add_argument('--observe-only', action='store_true')
+    args = parser.parse_args()
+    if not args.once and args.interval < 60:
+        parser.error('--interval must be at least 60 seconds')
+    while True:
+        db = None
+        try:
+            db = Database(args.libpq, args.conninfo)
+            run_cycle(db, settings(db), not args.observe_only)
+        except (DatabaseError, OSError, ValueError) as exc:
+            print(f'{dt.datetime.now().isoformat(timespec="seconds")} stewardship cycle failed: {exc}', file=sys.stderr)
+            if args.once:
+                return 1
+        finally:
+            if db:
+                db.close()
+        if args.once:
+            return 0
+        time.sleep(args.interval)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

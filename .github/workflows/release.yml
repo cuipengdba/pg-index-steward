@@ -1,0 +1,83 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18, 19]
+        platform:
+          - {runner: ubuntu-22.04, arch: x86_64}
+          - {runner: ubuntu-22.04-arm, arch: aarch64}
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install matching PostgreSQL headers and binaries
+        env:
+          PG_MAJOR: ${{ matrix.pg }}
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt jammy-pgdg main' | sudo tee /etc/apt/sources.list.d/steward-pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends "postgresql-$PG_MAJOR" "postgresql-server-dev-$PG_MAJOR"
+      - name: Build and check indexing policies
+        env:
+          PG_MAJOR: ${{ matrix.pg }}
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          set -euo pipefail
+          pgconfig="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config"
+          make PG_CONFIG="$pgconfig"
+          mkdir -p "payload/$ARCH/pg$PG_MAJOR"
+          cp pg_index_steward.so "payload/$ARCH/pg$PG_MAJOR/"
+          sudo bash ./install.sh --files-only --pg-config "$pgconfig"
+          bash tests/integration.sh "$pgconfig"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform.arch }}-pg${{ matrix.pg }}
+          path: payload/${{ matrix.platform.arch }}/pg${{ matrix.pg }}/pg_index_steward.so
+          if-no-files-found: error
+
+  package:
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          pattern: binary-*
+      - name: Assemble bundles and SHA-256 checksums
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_NAME" = "v$(sed -n "s/^default_version = '\(.*\)'$/\1/p" pg_index_steward.control)"
+          for arch in x86_64 aarch64; do
+            for major in {14..19}; do
+              mkdir -p "stage/$arch/pg$major"
+              cp "binaries/binary-$arch-pg$major/pg_index_steward.so" "stage/$arch/pg$major/"
+            done
+            bash scripts/package.sh "$arch" "stage/$arch"
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Publish release packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --verify-tag --generate-notes --prerelease
+          fi

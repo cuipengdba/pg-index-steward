@@ -1,0 +1,228 @@
+#include "postgres.h"
+#include "fmgr.h"
+#include "lib/stringinfo.h"
+#include "nodes/parsenodes.h"
+#include "parser/parser.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/json.h"
+
+#if PG_VERSION_NUM >= 190000
+PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.1.0");
+#else
+PG_MODULE_MAGIC;
+#endif
+
+static bool auto_create;
+static bool auto_drop_existing;
+static bool auto_drop_managed;
+static char *maintenance_window;
+
+static bool
+valid_window(char **value, void **extra, GucSource source)
+{
+	const char *s = *value;
+	int positions[] = {0, 1, 3, 4, 6, 7, 9, 10};
+	int i;
+
+	if (s == NULL || strlen(s) != 11 || s[2] != ':' || s[5] != '-' || s[8] != ':')
+		return false;
+	for (i = 0; i < lengthof(positions); i++)
+		if (s[positions[i]] < '0' || s[positions[i]] > '9')
+			return false;
+	return 10 * (s[0] - '0') + (s[1] - '0') < 24 && s[3] < '6' &&
+		10 * (s[6] - '0') + (s[7] - '0') < 24 && s[9] < '6' &&
+		strncmp(s, s + 6, 5) != 0;
+}
+
+void _PG_init(void);
+void
+_PG_init(void)
+{
+	DefineCustomBoolVariable("pg_index_steward.auto_create", "Create eligible indexes in the maintenance window.", NULL,
+							 &auto_create, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable("pg_index_steward.maintenance_window", "Maintenance window in the server's configured time zone.", NULL,
+							   &maintenance_window, "23:00-06:00", PGC_SIGHUP, 0, valid_window, NULL, NULL);
+	DefineCustomBoolVariable("pg_index_steward.auto_drop_existing", "Retire eligible pre-existing non-unique indexes.", NULL,
+							 &auto_drop_existing, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_index_steward.auto_drop_managed", "Retire eligible indexes created by Steward.", NULL,
+							 &auto_drop_managed, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+}
+
+typedef struct Predicates
+{
+	const char *alias;
+	const char *relation;
+	const char *eq[8];
+	const char *range;
+	int n_eq;
+	bool ambiguous_range;
+} Predicates;
+
+static const char *
+column_name(Node *node, const Predicates *pred)
+{
+	ColumnRef *ref;
+	Node *last;
+
+	if (node == NULL || !IsA(node, ColumnRef))
+		return NULL;
+	ref = (ColumnRef *) node;
+	if (list_length(ref->fields) == 2)
+	{
+		Node *first = linitial(ref->fields);
+		const char *qualifier = pred->alias ? pred->alias : pred->relation;
+
+		if (!IsA(first, String) || strcmp(strVal(first), qualifier) != 0)
+			return NULL;
+	}
+	else if (list_length(ref->fields) != 1)
+		return NULL;
+	last = llast(ref->fields);
+	return IsA(last, String) ? strVal(last) : NULL;
+}
+
+static bool
+bound_value(Node *node)
+{
+	return node != NULL && (IsA(node, ParamRef) || IsA(node, A_Const));
+}
+
+static void
+collect(Node *node, Predicates *pred)
+{
+	A_Expr *expr;
+	const char *col = NULL;
+	const char *op;
+	bool equality = false;
+	int i;
+
+	if (node == NULL)
+		return;
+	if (IsA(node, BoolExpr))
+	{
+		BoolExpr *b = (BoolExpr *) node;
+		ListCell *cell;
+
+		if (b->boolop == AND_EXPR)
+			foreach(cell, b->args)
+				collect(lfirst(cell), pred);
+		return;
+	}
+	if (!IsA(node, A_Expr))
+		return;
+	expr = (A_Expr *) node;
+	if (list_length(expr->name) != 1 || !IsA(linitial(expr->name), String))
+		return;
+	op = strVal(linitial(expr->name));
+	if (expr->kind == AEXPR_IN && strcmp(op, "=") == 0 && expr->rexpr != NULL && IsA(expr->rexpr, List))
+	{
+		ListCell *item;
+		List *values = (List *) expr->rexpr;
+
+		if (list_length(values) > 16)
+			return;
+		foreach(item, values)
+			if (!bound_value(lfirst(item)))
+				return;
+		col = column_name(expr->lexpr, pred);
+		equality = true;
+	}
+	else if (expr->kind == AEXPR_OP)
+	{
+		equality = strcmp(op, "=") == 0;
+		if (!equality && strcmp(op, ">") && strcmp(op, ">=") && strcmp(op, "<") && strcmp(op, "<="))
+			return;
+		if (bound_value(expr->rexpr))
+			col = column_name(expr->lexpr, pred);
+		else if (bound_value(expr->lexpr))
+			col = column_name(expr->rexpr, pred);
+	}
+	if (!col)
+		return;
+	if (!equality)
+	{
+		if (pred->range && strcmp(col, pred->range) != 0)
+			pred->ambiguous_range = true;
+		pred->range = col;
+		return;
+	}
+	for (i = 0; i < pred->n_eq; i++)
+		if (strcmp(col, pred->eq[i]) == 0)
+			return;
+	if (pred->n_eq < lengthof(pred->eq))
+		pred->eq[pred->n_eq++] = col;
+}
+
+static void
+select_candidates(SelectStmt *stmt, StringInfo result, bool *first)
+{
+	RangeVar *rel;
+	Predicates pred = {0};
+	int i;
+
+	if (stmt->withClause || stmt->intoClause || stmt->lockingClause)
+		return;
+	if (stmt->op == SETOP_UNION)
+	{
+		select_candidates(stmt->larg, result, first);
+		select_candidates(stmt->rarg, result, first);
+		return;
+	}
+	if (stmt->op != SETOP_NONE || list_length(stmt->fromClause) != 1 || !IsA(linitial(stmt->fromClause), RangeVar))
+		return;
+	rel = linitial_node(RangeVar, stmt->fromClause);
+	if (rel->catalogname || !rel->schemaname)
+		return;
+	pred.alias = rel->alias ? rel->alias->aliasname : NULL;
+	pred.relation = rel->relname;
+	collect(stmt->whereClause, &pred);
+	if (pred.n_eq == 0 && (!pred.range || pred.ambiguous_range))
+		return;
+	if (!*first)
+		appendStringInfoChar(result, ',');
+	*first = false;
+	appendStringInfoString(result, "{\"schema\":");
+	escape_json(result, rel->schemaname);
+	appendStringInfoString(result, ",\"table\":");
+	escape_json(result, rel->relname);
+	appendStringInfoString(result, ",\"eq\":[");
+	for (i = 0; i < pred.n_eq; i++)
+	{
+		if (i)
+			appendStringInfoChar(result, ',');
+		escape_json(result, pred.eq[i]);
+	}
+	appendStringInfoString(result, "],\"range\":");
+	if (pred.range && !pred.ambiguous_range)
+		escape_json(result, pred.range);
+	else
+		appendStringInfoString(result, "null");
+	appendStringInfoChar(result, '}');
+}
+
+PG_FUNCTION_INFO_V1(steward_candidates);
+Datum
+steward_candidates(PG_FUNCTION_ARGS)
+{
+	text *sql = PG_GETARG_TEXT_PP(0);
+	StringInfoData result;
+	bool first = true;
+	List *list;
+
+	initStringInfo(&result);
+	appendStringInfoChar(&result, '[');
+	if (VARSIZE_ANY_EXHDR(sql) <= 16384)
+	{
+		list = raw_parser(text_to_cstring(sql), RAW_PARSE_DEFAULT);
+		if (list_length(list) == 1)
+		{
+			RawStmt *raw = linitial_node(RawStmt, list);
+
+			if (IsA(raw->stmt, SelectStmt))
+				select_candidates((SelectStmt *) raw->stmt, &result, &first);
+		}
+	}
+	appendStringInfoChar(&result, ']');
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(result.data)));
+}

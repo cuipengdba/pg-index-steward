@@ -1,0 +1,5 @@
+*.o
+*.so
+*.bc
+__pycache__/
+dist/
