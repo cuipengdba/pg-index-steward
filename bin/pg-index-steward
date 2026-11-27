@@ -306,7 +306,9 @@ def propose_indexes(db, qstats, deltas):
                 continue
             sig = hashlib.sha256(json.dumps([*pair, keys], ensure_ascii=False).encode()).hexdigest()[:24]
             detail = proposals.setdefault((target['oid'], sig), dict(schema=pair[0], table=pair[1], keys=keys,
-                                         index='pgis_' + sig, score=0, samples=[]))
+                                         index='pgis_' + sig, score=0, samples=[], advisory=True,
+                                         estimated_table_bytes=target['bytes']))
+            detail['advisory'] = detail['advisory'] and item.get('advisory', False)
             detail['score'] += row['elapsed']
             detail['samples'].append({k: row[k] for k in ('userid', 'queryid', 'toplevel', 'calls', 'elapsed', 'reads', 'hits')})
     for (target, sig), detail in proposals.items():
@@ -614,6 +616,7 @@ def run_cycle(db, cfg, allow_ddl):
             return
         jobs = db.rows(f"""SELECT * FROM {SCHEMA}.jobs WHERE state='queued'
                        AND next_attempt_at<=clock_timestamp()
+                       AND NOT COALESCE((detail->>'advisory')::boolean,false)
                        ORDER BY (created_at<clock_timestamp()-interval '2 days') DESC,
                                 CASE WHEN created_at<clock_timestamp()-interval '2 days' THEN created_at END,
                                 action='create' DESC, COALESCE((detail->>'score')::float8, 0) DESC,id LIMIT 50""")

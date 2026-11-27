@@ -10,7 +10,7 @@
 #include "utils/json.h"
 
 #if PG_VERSION_NUM >= 190000
-PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.3.0");
+PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.4.0");
 #else
 PG_MODULE_MAGIC;
 #endif
@@ -157,6 +157,23 @@ collect(Node *node, Predicates *pred)
 }
 
 static void
+append_advisory(RangeVar *rel, const char *key, StringInfo result, bool *first)
+{
+	if (!key || !rel->schemaname || rel->catalogname)
+		return;
+	if (!*first)
+		appendStringInfoChar(result, ',');
+	*first = false;
+	appendStringInfoString(result, "{\"schema\":");
+	escape_json(result, rel->schemaname);
+	appendStringInfoString(result, ",\"table\":");
+	escape_json(result, rel->relname);
+	appendStringInfoString(result, ",\"eq\":[");
+	escape_json(result, key);
+	appendStringInfoString(result, "],\"range\":null,\"advisory\":true}");
+}
+
+static void
 select_candidates(SelectStmt *stmt, StringInfo result, bool *first)
 {
 	RangeVar *rel;
@@ -171,7 +188,35 @@ select_candidates(SelectStmt *stmt, StringInfo result, bool *first)
 		select_candidates(stmt->rarg, result, first);
 		return;
 	}
-	if (stmt->op != SETOP_NONE || list_length(stmt->fromClause) != 1 || !IsA(linitial(stmt->fromClause), RangeVar))
+	if (stmt->op != SETOP_NONE || list_length(stmt->fromClause) != 1)
+		return;
+	if (IsA(linitial(stmt->fromClause), JoinExpr))
+	{
+		JoinExpr *join = linitial_node(JoinExpr, stmt->fromClause);
+		if (IsA(join->larg, RangeVar) && IsA(join->rarg, RangeVar) && IsA(join->quals, A_Expr))
+		{
+			RangeVar *left = (RangeVar *) join->larg;
+			RangeVar *right = (RangeVar *) join->rarg;
+			A_Expr *expr = (A_Expr *) join->quals;
+			Predicates a = {0}, b = {0};
+			if (expr->kind != AEXPR_OP || list_length(expr->name) != 1 ||
+				strcmp(strVal(linitial(expr->name)), "=") ||
+				!IsA(expr->lexpr, ColumnRef) || !IsA(expr->rexpr, ColumnRef) ||
+				list_length(((ColumnRef *) expr->lexpr)->fields) != 2 ||
+				list_length(((ColumnRef *) expr->rexpr)->fields) != 2)
+				return;
+			a.relation = left->relname;
+			a.alias = left->alias ? left->alias->aliasname : NULL;
+			b.relation = right->relname;
+			b.alias = right->alias ? right->alias->aliasname : NULL;
+			append_advisory(left, column_name(expr->lexpr, &a), result, first);
+			append_advisory(left, column_name(expr->rexpr, &a), result, first);
+			append_advisory(right, column_name(expr->lexpr, &b), result, first);
+			append_advisory(right, column_name(expr->rexpr, &b), result, first);
+		}
+		return;
+	}
+	if (!IsA(linitial(stmt->fromClause), RangeVar))
 		return;
 	rel = linitial_node(RangeVar, stmt->fromClause);
 	if (rel->catalogname || !rel->schemaname)
@@ -180,7 +225,15 @@ select_candidates(SelectStmt *stmt, StringInfo result, bool *first)
 	pred.relation = rel->relname;
 	collect(stmt->whereClause, &pred);
 	if (pred.n_eq == 0 && (!pred.range || pred.ambiguous_range))
+	{
+		if (stmt->limitCount && list_length(stmt->sortClause) == 1 && !stmt->groupClause && !stmt->distinctClause)
+		{
+			SortBy *sort = linitial_node(SortBy, stmt->sortClause);
+			if (sort->sortby_dir != SORTBY_USING)
+				append_advisory(rel, column_name(sort->node, &pred), result, first);
+		}
 		return;
+	}
 	if (!*first)
 		appendStringInfoChar(result, ',');
 	*first = false;
