@@ -153,6 +153,9 @@ def usage_counters(db, qstats, info):
                               s.shared_blks_hit AS hits, s.temp_blks_written AS temporary,
                               s.total_plan_time AS planning, s.plans, s.rows AS result_rows,
                               s.wal_bytes AS wal_bytes,
+                              COALESCE((to_jsonb(s)->>'shared_blk_read_time')::float8,
+                                       (to_jsonb(s)->>'blk_read_time')::float8) AS shared_read_ms,
+                              EXTRACT(epoch FROM statement_timestamp())::float8 AS sampled_epoch,
                               i.stats_reset::text AS reset_marker, i.dealloc AS dealloc,
                               to_jsonb(s)->>'stats_since' AS stats_since,
                               old.snapshot AS previous
@@ -178,8 +181,9 @@ def workload(db, qstats, info):
         counters = ('calls', 'elapsed', 'reads', 'hits', 'temporary')
         delta = {k: row[k] - old[k] for k in counters}
         if delta['calls'] > 0 and min(delta.values()) >= 0:
-            for k in ('planning', 'plans', 'result_rows', 'wal_bytes'):
-                delta[k] = max(0, row[k] - old.get(k, row[k]))
+            for k in ('planning', 'plans', 'result_rows', 'wal_bytes', 'shared_read_ms'):
+                delta[k] = max(0, (row[k] or 0) - (old.get(k, row[k]) or 0))
+            delta['period_seconds'] = max(0, row['sampled_epoch'] - old.get('sampled_epoch', row['sampled_epoch']))
             changes.append({**row, **delta})
     if snapshots:
         values = ','.join(f'({u}::oid,{q}::bigint,{literal(top)},{json_value(v)})' for u, q, top, v in snapshots)
@@ -188,9 +192,39 @@ def workload(db, qstats, info):
     return sorted(changes, key=lambda x: x['elapsed'], reverse=True)
 
 
-def record_diagnostics(db, deltas):
+def candidate_shape(db, qstats, delta):
+    try:
+        row = db.one(f"""SELECT {SCHEMA}.candidates(query) AS candidates FROM {qstats}
+                WHERE userid={delta['userid']} AND queryid={delta['queryid']}
+                  AND dbid=(SELECT oid FROM pg_database WHERE datname=current_database())
+                  AND toplevel={literal(delta['toplevel'])} AND query IS NOT NULL""")
+        return row['candidates'] if row else []
+    except DatabaseError:
+        return []
+
+
+def record_diagnostics(db, qstats, deltas):
     values = []
-    for delta in deltas:
+    waits = {}
+    for row in db.rows("""SELECT usesysid AS userid,query_id,wait_event_type,count(*) AS samples
+            FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()
+            AND state='active' AND query_id IS NOT NULL AND wait_event_type IS NOT NULL
+            GROUP BY usesysid,query_id,wait_event_type"""):
+        waits.setdefault((row['userid'], row['query_id']), {})[row['wait_event_type']] = row['samples']
+    io_tracking = db.one("SELECT current_setting('track_io_timing')='on' AS enabled")['enabled']
+    for position, delta in enumerate(deltas):
+        shape = candidate_shape(db, qstats, delta) if position < 30 or not delta['toplevel'] and position < 100 else []
+        delta['candidate_shape'] = shape
+        wait = waits.get((delta['userid'], delta['queryid']), {}) if delta['toplevel'] else {}
+        dimensions = {'planning_observed': delta['plans'] > 0,
+                      'shared_read_ms': delta['shared_read_ms'] if io_tracking else None,
+                      'period_seconds': delta['period_seconds'], 'wait_types': wait,
+                      'wait_samples': sum(wait.values())}
+        tables = {(s['schema'], s['table']) for s in shape if not s.get('advisory')}
+        if len(tables) == 1 and len(shape) == 1:
+            schema, table = next(iter(tables))
+            dimensions['relation'] = {'schema_name': schema, 'table_name': table,
+                'shape': json.dumps([sorted(shape[0]['eq']), shape[0]['range']], ensure_ascii=False)}
         category = ('spill' if delta['temporary'] > 0 else
                     'planning' if delta['planning'] > delta['elapsed'] / 2 else
                     'nested' if not delta['toplevel'] else
@@ -198,13 +232,14 @@ def record_diagnostics(db, deltas):
         values.append(f"({int(delta['userid'])}::oid,{delta['queryid']}::bigint,{literal(delta['toplevel'])},"
              + ','.join(['clock_timestamp()', str(delta['elapsed']), str(delta['planning']),
              str(delta['calls']), str(delta['plans']), str(delta['reads'] + delta['hits']),
-             str(delta['temporary']), literal(category)]) + ')')
+             str(delta['temporary']), literal(category), json_value(dimensions)]) + ')')
     if values:
         db.execute(f"""INSERT INTO {SCHEMA}.query_diagnostics VALUES {','.join(values)}
                        ON CONFLICT(userid,queryid,toplevel) DO UPDATE SET
                        sampled_at=excluded.sampled_at,elapsed_ms=excluded.elapsed_ms,
                        planning_ms=excluded.planning_ms,calls=excluded.calls,plans=excluded.plans,
-                       shared_blocks=excluded.shared_blocks,temp_blocks=excluded.temp_blocks,category=excluded.category""")
+                       shared_blocks=excluded.shared_blocks,temp_blocks=excluded.temp_blocks,category=excluded.category,
+                       dimensions=excluded.dimensions""")
 
 
 def eligible_table(db, schema, name):
@@ -325,14 +360,7 @@ def propose_indexes(db, qstats, deltas, policy):
     table_cache = {}
     costly = (r for r in deltas if r['calls'] >= MIN_CALLS and r['elapsed'] >= MIN_TOTAL_MS)
     for row in islice(costly, 30):
-        try:
-            parsed = db.one(f"""SELECT {SCHEMA}.candidates(query) AS candidates FROM {qstats}
-                  WHERE userid={row['userid']} AND queryid={row['queryid']}
-                    AND dbid=(SELECT oid FROM pg_database WHERE datname=current_database())
-                    AND toplevel={literal(row['toplevel'])} AND query IS NOT NULL""")
-        except DatabaseError:
-            continue  # A normalized statement can be truncated or unparsable.
-        for item in parsed['candidates'] if parsed else []:
+        for item in row['candidate_shape'] or candidate_shape(db, qstats, row):
             pair = item['schema'], item['table']
             if pair not in table_cache:
                 table_cache[pair] = eligible_table(db, *pair)
@@ -888,7 +916,7 @@ def run_cycle(db, cfg, allow_ddl):
             return
         recover_jobs(db, policy)
         deltas = workload(db, qstats, info)
-        record_diagnostics(db, deltas)
+        record_diagnostics(db, qstats, deltas)
         propose_indexes(db, qstats, deltas, policy)
         observe_indexes(db, policy)
         verified_replicas = observe_replicas(db, policy)

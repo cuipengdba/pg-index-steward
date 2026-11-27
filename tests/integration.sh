@@ -63,6 +63,10 @@ sys.argv = [sys.argv[1], '--libpq', sys.argv[2], '--once', '--observe-only']
 raise SystemExit(stub['main']())
 PY
 same "$(sql "SELECT count(*) FROM index_steward.jobs WHERE action='create' AND target='public.devices'::regclass AND detail->'keys'='[\"id\"]'::jsonb")" 1
+if [[ $(sql "SELECT to_regclass('index_steward.relation_hotspots') IS NOT NULL") == t ]]; then
+    same "$(sql "SELECT count(*) FROM index_steward.relation_hotspots WHERE schema_name='public' AND table_name='devices' AND calls>=55")" 1
+    same "$(sql "SELECT count(*) FROM index_steward.relation_hotspots WHERE table_name='devices' AND planning_ms IS NULL")" 1
+fi
 if [[ $(sql "SELECT to_regprocedure('index_steward.hypo_reset()') IS NOT NULL") == t ]]; then
     same "$(sql "SELECT detail->'plan_evidence'->>'uses_candidate' FROM index_steward.jobs WHERE action='create'")" true
     same "$(sql "SELECT count(*) FROM pg_extension WHERE extname='hypopg'")" 0
