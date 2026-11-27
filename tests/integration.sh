@@ -120,6 +120,16 @@ if [[ $(sql "SELECT to_regprocedure('index_steward.approve_rollback(bigint)') IS
 fi
 grep -q 'PG Index Steward .*"reason":"disk_headroom"' "$tmp/server.log"
 grep -q 'PG Index Steward .*"event":"done"' "$tmp/server.log"
+if [[ $(sql "SELECT to_regprocedure('index_steward.status()') IS NOT NULL") == t ]]; then
+    psql -q <<'SQL'
+CREATE ROLE metrics_reader LOGIN;
+GRANT USAGE ON SCHEMA index_steward TO metrics_reader;
+GRANT EXECUTE ON FUNCTION index_steward.status() TO metrics_reader;
+SQL
+    PGUSER=metrics_reader worker --status | grep -q '"version"'
+    PGUSER=metrics_reader worker --metrics | grep -q '^pg_index_steward_jobs{'
+    same "$(sql "SELECT has_table_privilege('metrics_reader','index_steward.jobs','SELECT')")" f
+fi
 if [[ $(sql "SELECT to_regprocedure('index_steward.queue_partition_index(regclass,name[])') IS NOT NULL") == t ]]; then
     psql -q <<'SQL'
 UPDATE index_steward.policy SET paused=false, daily_limit=25;
