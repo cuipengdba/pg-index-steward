@@ -617,6 +617,25 @@ def replica_allows_drop(db, idx, guards, policy):
     return services.issubset({row['service'] for row in rows})
 
 
+def observe_primary_epoch(db, policy):
+    epoch = db.one("""SELECT left(pg_walfile_name(pg_current_wal_insert_lsn()),8) AS timeline""")['timeline']
+    if epoch == policy['primary_epoch']:
+        return db.one(f"SELECT primary_epoch_at+make_interval(secs=>failover_grace_seconds)"
+                      f" <= now() AS ready FROM {SCHEMA}.policy WHERE singleton")['ready']
+    if policy['primary_epoch'] is None:
+        db.execute(f"UPDATE {SCHEMA}.policy SET primary_epoch={literal(epoch)},"
+                   "primary_epoch_at='-infinity' WHERE singleton")
+        return True
+    db.execute(f"""BEGIN;
+        UPDATE {SCHEMA}.policy SET primary_epoch={literal(epoch)},primary_epoch_at=now() WHERE singleton;
+        DELETE FROM {SCHEMA}.replica_usage;
+        UPDATE {SCHEMA}.index_usage SET idle_since=now();
+        DELETE FROM {SCHEMA}.workload;
+        COMMIT""")
+    event(db, 'primary_epoch_changed', reason='timeline_changed')
+    return policy['failover_grace_seconds'] == 0
+
+
 def protect(db, job):
     target = int(job['target'])
     return db.one(f"""SELECT NOT EXISTS (SELECT FROM pg_stat_activity a
@@ -889,6 +908,11 @@ def drop_index(db, job, cfg, guards, remaining, policy):
         update_job(db, job, 'cancelled', 'Index identity or dependencies changed')
         return False
     idx = rows[0]
+    held = db.one(f"SELECT EXISTS(SELECT FROM {SCHEMA}.retention_policy WHERE index_oid={int(idx['oid'])}"
+                  f" AND definition={literal(idx['ddl'])} AND preserve_until>now()) AS held")
+    if held['held']:
+        defer_job(db, job, 'retention_policy', policy)
+        return False
     rollback = job['detail'].get('rollback', False)
     if extension_managed(db, idx['table_oid'], idx['schema'], idx['table']):
         update_job(db, job, 'cancelled', 'Table is managed by another extension')
@@ -1039,6 +1063,7 @@ def run_cycle(db, cfg, allow_ddl):
             raise DatabaseError('Missing index_steward.policy row')
         if not db.one("SELECT pg_try_advisory_lock(1885825395,176884235) AS held")['held']:
             return
+        primary_ready = observe_primary_epoch(db, policy)
         recover_jobs(db, policy)
         deltas = workload(db, qstats, info)
         record_diagnostics(db, qstats, deltas)
@@ -1047,6 +1072,9 @@ def run_cycle(db, cfg, allow_ddl):
         verified_replicas = observe_replicas(db, policy)
         measure(db, deltas, policy)
         if not allow_ddl or policy['paused']:
+            return
+        if not primary_ready:
+            event(db, 'cycle_waiting', reason='failover_grace')
             return
         cfg = settings(db)
         remaining = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])

@@ -132,6 +132,17 @@ same "$(sql 'SELECT count(*) FROM index_steward.managed_indexes WHERE retired_at
 same "$(sql "SELECT to_regclass('public.existing_index')::text")" existing_index
 setting auto_drop_existing on
 reload
+if [[ $(sql "SELECT to_regclass('index_steward.retention_policy') IS NOT NULL") == t ]]; then
+    sql "UPDATE index_steward.policy SET primary_epoch='00000000'" >/dev/null
+    worker
+    grep -q 'PG Index Steward .*"reason":"failover_grace"' "$tmp/server.log"
+    same "$(sql "SELECT count(*) FROM index_steward.index_usage WHERE idle_since<now()-interval '1 minute'")" 0
+    sql "UPDATE index_steward.policy SET primary_epoch_at='-infinity'; UPDATE index_steward.index_usage SET idle_since=now()-interval '61 days'" >/dev/null
+    sql "SELECT index_steward.protect_index('public.existing_index')" >/dev/null
+    worker
+    same "$(sql "SELECT reason FROM index_steward.jobs WHERE action='drop' AND state='queued'")" retention_policy
+    sql "DELETE FROM index_steward.retention_policy; UPDATE index_steward.jobs SET next_attempt_at='-infinity' WHERE state='queued'" >/dev/null
+fi
 if [[ $(sql "SELECT EXISTS(SELECT FROM pg_attribute WHERE attrelid='index_steward.policy'::regclass AND attname='replica_services')") == t ]]; then
     sql "UPDATE index_steward.policy SET replica_services=ARRAY['pgis_unconfigured_replica']" >/dev/null
     worker
