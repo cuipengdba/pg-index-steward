@@ -16,7 +16,7 @@ extern Datum hypopg_reset(PG_FUNCTION_ARGS);
 static bool steward_hypo_initialized = false;
 
 #if PG_VERSION_NUM >= 190000
-PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.5.0");
+PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.6.0");
 #else
 PG_MODULE_MAGIC;
 #endif

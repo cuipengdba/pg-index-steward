@@ -499,7 +499,10 @@ def create_index(db, job, cfg, remaining, policy):
                         VALUES ({idx['oid']},{tbl['oid']},{literal(idx['fingerprint'])},{literal(idx['ddl'])},{job['id']})
                         RETURNING index_oid)
                         INSERT INTO {SCHEMA}.verdicts(job_id,index_oid,index_fingerprint,baseline)
-                        SELECT {job['id']}, index_oid,{literal(idx['fingerprint'])},{json_value(detail['samples'])} FROM managed""")
+                        SELECT {job['id']}, index_oid,{literal(idx['fingerprint'])},{json_value(detail['samples'])} FROM managed
+                        ON CONFLICT (job_id) DO UPDATE SET index_oid=excluded.index_oid,
+                            index_fingerprint=excluded.index_fingerprint,baseline=excluded.baseline,
+                            observations='[]',state='observing',updated_at=clock_timestamp()""")
         update_job(db, job, 'done', 'Index valid; observing natural traffic')
     except DatabaseError as exc:
         idx = fetch_index(db, detail['schema'], detail['index'], tbl['oid'])
@@ -526,14 +529,15 @@ def drop_index(db, job, cfg, guards, remaining, policy):
         update_job(db, job, 'cancelled', 'Index identity or dependencies changed')
         return False
     idx = rows[0]
+    rollback = job['detail'].get('rollback', False)
     if extension_managed(db, idx['table_oid'], idx['schema'], idx['table']):
         update_job(db, job, 'cancelled', 'Table is managed by another extension')
         return False
-    permitted = cfg['auto_drop_managed'] if idx['managed'] else cfg['auto_drop_existing']
+    permitted = idx['managed'] if rollback else (cfg['auto_drop_managed'] if idx['managed'] else cfg['auto_drop_existing'])
     if not permitted or not guards['no_replica_evidence']:
         defer_job(db, job, 'drop_disabled' if not permitted else 'replica_usage_unverified', policy)
         return False
-    if not idx['valid'] or not continuously_idle(idx) or not idx['idle_long']:
+    if not idx['valid'] or (not rollback and (not continuously_idle(idx) or not idx['idle_long'])):
         update_job(db, job, 'cancelled', 'Idle evidence no longer qualifies')
         return False
     # Persist recreatable DDL before executing the nontransactional operation.
@@ -543,7 +547,12 @@ def drop_index(db, job, cfg, guards, remaining, policy):
         db.execute(f"DROP INDEX CONCURRENTLY {relation(idx['schema'],idx['name'])}")
         db.execute(f"""UPDATE {SCHEMA}.managed_indexes SET retired_at=clock_timestamp()
                        WHERE index_oid={idx['oid']} AND fingerprint={literal(idx['fingerprint'])}""")
-        update_job(db, job, 'done', 'Index retired; original DDL retained in detail')
+        update_job(db, job, 'done', 'Index retired; original DDL retained in detail', 'rollback' if rollback else 'idle')
+        if rollback:
+            db.execute(f"""UPDATE {SCHEMA}.verdicts SET state='rolled_back',updated_at=clock_timestamp()
+                           WHERE index_oid={idx['oid']} AND index_fingerprint={literal(idx['fingerprint'])}""")
+            db.execute(f"""UPDATE {SCHEMA}.policy SET paused=true WHERE singleton""")
+            event(db, 'cycle_paused', job, 'rollback_completed')
     except DatabaseError as exc:
         current = index_inventory(db, job['target'])
         if retryable(exc) and current and current[0]['valid']:
@@ -555,7 +564,7 @@ def drop_index(db, job, cfg, guards, remaining, policy):
     return True
 
 
-def measure(db, deltas):
+def measure(db, deltas, policy):
     lookup = {(x['userid'], x['queryid'], x['toplevel']): x for x in deltas}
     for row in db.rows(f"SELECT * FROM {SCHEMA}.verdicts WHERE state='observing' ORDER BY job_id LIMIT 30"):
         baseline = row['baseline']
@@ -564,22 +573,35 @@ def measure(db, deltas):
             k = item['userid'], item['queryid'], item['toplevel']
             sample = lookup.get(k)
             if sample:
-                history.append({name: sample[name] for name in ('userid','queryid','toplevel','calls','elapsed','reads','hits')})
+                history.append({name: sample[name] for name in ('userid','queryid','toplevel','calls','elapsed','reads','hits','wal_bytes')})
         if not history:
             continue
         results = []
+        strong_regression = []
         for item in baseline:
             selected = [x for x in history if all(x[key] == item[key] for key in ('userid','queryid','toplevel'))]
             calls = sum(x['calls'] for x in selected)
             if calls >= OBS_MIN_CALLS and len(selected) >= 3:
                 observed = sum(x['elapsed'] for x in selected) / calls
                 original = item['elapsed'] / item['calls']
-                results.append(observed / original)
+                if original <= 0:
+                    continue
+                ratio = observed / original
+                results.append(ratio)
+                blocks_old = (item['hits'] + item['reads']) / item['calls']
+                blocks_new = sum(x['hits'] + x['reads'] for x in selected) / calls
+                strong_regression.append(ratio >= 2 and blocks_old > 0 and blocks_new >= blocks_old * 1.5)
         state = 'observing'
         if len(results) == len(baseline):
             state = 'regression_review' if max(results) > 1.20 else ('improved' if max(results) <= 0.80 else 'mixed')
         db.execute(f"""UPDATE {SCHEMA}.verdicts SET observations={json_value(history[-300:])},
                        state={literal(state)},updated_at=clock_timestamp() WHERE job_id={row['job_id']}""")
+        if state != 'observing':
+            event(db, 'verdict', {'id': row['job_id'], 'action': 'create'}, state)
+        if state == 'regression_review' and policy.get('auto_rollback') and all(strong_regression):
+            indexes = index_inventory(db, row['index_oid'])
+            if indexes and indexes[0]['managed'] and indexes[0]['scans'] >= 100:
+                db.execute(f"SELECT {SCHEMA}.approve_rollback({row['job_id']})")
 
 
 def allowed_by_policy(job, policy):
@@ -633,7 +655,7 @@ def run_cycle(db, cfg, allow_ddl):
         record_diagnostics(db, deltas)
         propose_indexes(db, qstats, deltas, policy)
         observe_indexes(db)
-        measure(db, deltas)
+        measure(db, deltas, policy)
         if not allow_ddl or policy['paused']:
             return
         cfg = settings(db)
@@ -647,7 +669,12 @@ def run_cycle(db, cfg, allow_ddl):
         jobs = db.rows(f"""SELECT * FROM {SCHEMA}.jobs WHERE state='queued'
                        AND next_attempt_at<=clock_timestamp()
                        AND NOT COALESCE((detail->>'advisory')::boolean,false)
-                       ORDER BY (created_at<clock_timestamp()-interval '2 days') DESC,
+                    AND (action<>'create' OR {literal(cfg['auto_create'])})
+                       AND (action<>'drop' OR COALESCE((detail->>'rollback')::boolean,false)
+                           OR CASE WHEN COALESCE((detail->>'managed')::boolean,false)
+                                   THEN {literal(cfg['auto_drop_managed'])} ELSE {literal(cfg['auto_drop_existing'])} END)
+                       ORDER BY COALESCE((detail->>'rollback')::boolean,false) DESC,
+                                (created_at<clock_timestamp()-interval '2 days') DESC,
                                 CASE WHEN created_at<clock_timestamp()-interval '2 days' THEN created_at END,
                                 action='create' DESC, COALESCE((detail->>'score')::float8, 0) DESC,id LIMIT 50""")
         for job in jobs:

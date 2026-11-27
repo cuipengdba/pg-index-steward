@@ -103,6 +103,14 @@ worker
 same "$(sql "SELECT to_regclass('public.existing_index') IS NULL")" t
 same "$(sql "SELECT count(*) FROM index_steward.jobs WHERE action='drop' AND state='done' AND detail ? 'ddl'")" 2
 same "$(sql "SELECT to_regclass('public.other_pkey') IS NOT NULL")" t
+if [[ $(sql "SELECT to_regprocedure('index_steward.approve_rollback(bigint)') IS NOT NULL") == t ]]; then
+    sql "UPDATE index_steward.jobs SET state='queued' WHERE action='create'; UPDATE index_steward.policy SET min_free_bytes=0" >/dev/null
+    worker
+    sql "UPDATE index_steward.verdicts SET state='regression_review'; SELECT index_steward.approve_rollback(job_id) FROM index_steward.verdicts" >/dev/null
+    worker
+    same "$(sql "SELECT count(*) FROM index_steward.verdicts WHERE state='rolled_back'")" 1
+    same "$(sql 'SELECT paused FROM index_steward.policy')" t
+fi
 grep -q 'PG Index Steward .*"reason":"disk_headroom"' "$tmp/server.log"
 grep -q 'PG Index Steward .*"event":"done"' "$tmp/server.log"
 printf 'Integration passed: %s\n' "$("$pg_config" --version)"
