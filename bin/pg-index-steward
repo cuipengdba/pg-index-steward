@@ -758,6 +758,19 @@ def partition_children(db, parent):
         ORDER BY c.oid""")
 
 
+def queue_partition_repairs(db, policy):
+    if not policy['auto_resume_partitions']:
+        return
+    jobs = db.rows(f"""SELECT j.target,j.signature,j.detail
+        FROM {SCHEMA}.partition_index_progress p JOIN {SCHEMA}.jobs j ON j.id=p.id
+        WHERE j.state='done' AND p.indisvalid=false AND p.attached_indexes<p.partitions
+          AND NOT EXISTS (SELECT FROM {SCHEMA}.jobs newer WHERE newer.id>j.id
+                          AND newer.target=j.target AND newer.signature=j.signature)
+        ORDER BY j.id LIMIT 20""")
+    for job in jobs:
+        upsert_job(db, 'create', job['target'], job['signature'], job['detail'])
+
+
 def partition_step(db, job, cfg, remaining, policy):
     detail = job['detail']
     target = job['target']
@@ -1068,6 +1081,7 @@ def run_cycle(db, cfg, allow_ddl):
         deltas = workload(db, qstats, info)
         record_diagnostics(db, qstats, deltas)
         propose_indexes(db, qstats, deltas, policy)
+        queue_partition_repairs(db, policy)
         observe_indexes(db, policy)
         verified_replicas = observe_replicas(db, policy)
         measure(db, deltas, policy)

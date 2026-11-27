@@ -193,6 +193,9 @@ SQL
     for _ in {1..5}; do worker; done
     same "$(sql "SELECT indisvalid FROM pg_index WHERE indrelid='public.events'::regclass")" t
     same "$(sql "SELECT state FROM index_steward.jobs WHERE target='public.events'::regclass")" done
+    if [[ $(sql "SELECT to_regclass('index_steward.partition_index_progress') IS NOT NULL") == t ]]; then
+        same "$(sql "SELECT attached_indexes||'/'||partitions FROM index_steward.partition_index_progress WHERE parent_oid='public.events'::regclass")" 2/2
+    fi
 fi
 if [[ $(sql "SELECT to_regprocedure('index_steward.retry_job(bigint)') IS NOT NULL") == t ]]; then
     sql "INSERT INTO index_steward.jobs (action,target,signature,detail,state,attempts,retry_streak)
