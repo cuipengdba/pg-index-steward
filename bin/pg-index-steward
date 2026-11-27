@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -59,6 +60,7 @@ def relation(schema, name):
 
 class Database:
     def __init__(self, library, conninfo):
+        self.library = library
         self.lib = ctypes.CDLL(str(library))
         signatures = {
             'PQconnectdb': (ctypes.c_void_p, (ctypes.c_char_p,)),
@@ -345,7 +347,7 @@ def propose_indexes(db, qstats, deltas, policy):
         upsert_job(db, 'create', target, sig, detail)
 
 
-def index_inventory(db, index_oid=None):
+def index_inventory(db, index_oid=None, idle_days=IDLE_DAYS):
     return db.rows(f"""SELECT s.indexrelid AS oid, s.relid AS table_oid, s.schemaname AS schema,
                          s.relname AS table, s.indexrelname AS name, s.idx_scan AS scans,
                          pg_relation_size(s.indexrelid) AS bytes, pg_get_indexdef(s.indexrelid) AS ddl,
@@ -359,7 +361,7 @@ def index_inventory(db, index_oid=None):
                          old.scans AS prior_scans, old.fingerprint AS prior_fingerprint,
                          old.reset_marker AS prior_reset, old.idle_since::text,
                          old.observed_at > clock_timestamp()-interval '{MAX_GAP_HOURS} hours' AS recent,
-                         old.idle_since <= clock_timestamp()-interval '{IDLE_DAYS} days' AS idle_long,
+                         old.idle_since <= clock_timestamp()-make_interval(days=>{int(idle_days)}) AS idle_long,
                          i.indisvalid AND i.indisready AND i.indislive AS valid
                     FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid=s.indexrelid
                     JOIN pg_class ic ON ic.oid=i.indexrelid JOIN pg_class tc ON tc.oid=i.indrelid
@@ -389,9 +391,9 @@ def continuously_idle(idx):
             idx['fingerprint'] == idx['prior_fingerprint'] and idx['reset_marker'] == idx['prior_reset'])
 
 
-def observe_indexes(db):
+def observe_indexes(db, policy):
     batch = []
-    for idx in index_inventory(db):
+    for idx in index_inventory(db, idle_days=policy['idle_days']):
         if not idx['valid']:
             continue
         idle = continuously_idle(idx)
@@ -407,6 +409,66 @@ def observe_indexes(db):
                     ON CONFLICT(index_oid) DO UPDATE SET fingerprint=excluded.fingerprint,
                     scans=excluded.scans, observed_at=excluded.observed_at,
                     idle_since=excluded.idle_since, reset_marker=excluded.reset_marker""")
+
+
+def observe_replicas(db, policy):
+    services = set(policy['replica_services'])
+    if not services:
+        return set()
+    identity = "SELECT system_identifier::text AS cluster,current_database() AS database FROM pg_control_system()"
+    primary = db.one(identity)
+    verified = set()
+    for service in sorted(services):
+        if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,63}', service):
+            event(db, 'replica_unavailable', reason='invalid_service')
+            continue
+        replica = None
+        try:
+            replica = Database(db.library, f'service={service} connect_timeout=3 target_session_attrs=standby')
+            if replica.one(identity) != primary:
+                event(db, 'replica_unavailable', reason='cluster_identity_mismatch')
+                continue
+            rows = replica.rows("""SELECT s.indexrelid AS oid,s.idx_scan AS scans,
+                md5(concat_ws('|',pg_get_indexdef(s.indexrelid),c.relfilenode::text,s.relid::text)) AS fingerprint,
+                concat_ws('|',d.stats_reset::text,pg_postmaster_start_time()::text,
+                          to_jsonb(s)->>'stats_reset') AS reset_marker
+                FROM pg_stat_user_indexes s JOIN pg_class c ON c.oid=s.indexrelid
+                JOIN pg_stat_database d ON d.datname=current_database()""")
+            for start in range(0, len(rows), 200):
+                batch = rows[start:start + 200]
+                values = ','.join(f"({literal(service)},{int(row['oid'])},{row['scans']},"
+                                  f"{literal(row['fingerprint'])},{literal(row['reset_marker'])})" for row in batch)
+                db.execute(f"""INSERT INTO {SCHEMA}.replica_usage AS old
+                    (service,index_oid,scans,fingerprint,reset_marker,observed_at,idle_since)
+                    SELECT service,oid::oid,scans,fingerprint,reset_marker,now(),now()
+                    FROM (VALUES {values}) AS v(service,oid,scans,fingerprint,reset_marker)
+                    ON CONFLICT (service,index_oid) DO UPDATE SET fingerprint=excluded.fingerprint,
+                    scans=excluded.scans,reset_marker=excluded.reset_marker,observed_at=excluded.observed_at,
+                    idle_since=CASE WHEN old.fingerprint=excluded.fingerprint AND old.scans=excluded.scans
+                        AND old.reset_marker=excluded.reset_marker AND old.observed_at>now()-interval '24 hours'
+                        THEN old.idle_since ELSE now() END""")
+            verified.add(service)
+        except (DatabaseError, OSError):
+            event(db, 'replica_unavailable', reason='connection_or_statistics')
+        finally:
+            if replica:
+                replica.close()
+    return verified
+
+
+def replica_allows_drop(db, idx, guards, policy):
+    services = set(policy['replica_services'])
+    if not services:
+        return guards['no_replica_evidence']
+    nodes = db.rows("SELECT application_name AS name FROM pg_stat_replication")
+    if (services != guards['verified_replicas'] or not guards['replication_healthy'] or
+            len(nodes) != len(services) or {row['name'] for row in nodes} != services):
+        return False
+    rows = db.rows(f"""SELECT service FROM {SCHEMA}.replica_usage
+        WHERE index_oid={idx['oid']} AND fingerprint={literal(idx['fingerprint'])}
+          AND observed_at>=now()-interval '5 minutes'
+          AND idle_since<=now()-make_interval(days=>{int(policy['idle_days'])})""")
+    return services.issubset({row['service'] for row in rows})
 
 
 def protect(db):
@@ -524,7 +586,7 @@ def create_index(db, job, cfg, remaining, policy):
 
 
 def drop_index(db, job, cfg, guards, remaining, policy):
-    rows = index_inventory(db, job['target'])
+    rows = index_inventory(db, job['target'], policy['idle_days'])
     if not rows or rows[0]['fingerprint'] != job['signature']:
         update_job(db, job, 'cancelled', 'Index identity or dependencies changed')
         return False
@@ -534,7 +596,7 @@ def drop_index(db, job, cfg, guards, remaining, policy):
         update_job(db, job, 'cancelled', 'Table is managed by another extension')
         return False
     permitted = idx['managed'] if rollback else (cfg['auto_drop_managed'] if idx['managed'] else cfg['auto_drop_existing'])
-    if not permitted or not guards['no_replica_evidence']:
+    if not permitted or not replica_allows_drop(db, idx, guards, policy):
         defer_job(db, job, 'drop_disabled' if not permitted else 'replica_usage_unverified', policy)
         return False
     if not idx['valid'] or (not rollback and (not continuously_idle(idx) or not idx['idle_long'])):
@@ -654,7 +716,8 @@ def run_cycle(db, cfg, allow_ddl):
         deltas = workload(db, qstats, info)
         record_diagnostics(db, deltas)
         propose_indexes(db, qstats, deltas, policy)
-        observe_indexes(db)
+        observe_indexes(db, policy)
+        verified_replicas = observe_replicas(db, policy)
         measure(db, deltas, policy)
         if not allow_ddl or policy['paused']:
             return
@@ -686,6 +749,7 @@ def run_cycle(db, cfg, allow_ddl):
                 defer_job(db, job, 'outside_allowlist', policy)
                 continue
             guards = protect(db)
+            guards['verified_replicas'] = verified_replicas
             if not guards['no_long_xact'] or not guards['replication_healthy']:
                 reason = 'long_transaction' if not guards['no_long_xact'] else 'replication_lag'
                 defer_job(db, job, reason, policy)

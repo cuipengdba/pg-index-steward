@@ -99,6 +99,13 @@ same "$(sql 'SELECT count(*) FROM index_steward.managed_indexes WHERE retired_at
 same "$(sql "SELECT to_regclass('public.existing_index')::text")" existing_index
 setting auto_drop_existing on
 reload
+if [[ $(sql "SELECT EXISTS(SELECT FROM pg_attribute WHERE attrelid='index_steward.policy'::regclass AND attname='replica_services')") == t ]]; then
+    sql "UPDATE index_steward.policy SET replica_services=ARRAY['pgis_unconfigured_replica']" >/dev/null
+    worker
+    same "$(sql "SELECT to_regclass('public.existing_index')::text")" existing_index
+    same "$(sql "SELECT reason FROM index_steward.jobs WHERE action='drop' AND state='queued'")" replica_usage_unverified
+    sql "UPDATE index_steward.policy SET replica_services='{}'; UPDATE index_steward.jobs SET next_attempt_at='-infinity' WHERE state='queued'" >/dev/null
+fi
 worker
 same "$(sql "SELECT to_regclass('public.existing_index') IS NULL")" t
 same "$(sql "SELECT count(*) FROM index_steward.jobs WHERE action='drop' AND state='done' AND detail ? 'ddl'")" 2
