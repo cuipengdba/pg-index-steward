@@ -33,7 +33,8 @@ same() { [[ $1 == "$2" ]] || { printf 'expected %s, got %s\n' "$2" "$1" >&2; exi
 
 psql -q <<'SQL'
 CREATE EXTENSION pg_stat_statements;
-CREATE EXTENSION pg_index_steward;
+CREATE EXTENSION pg_index_steward VERSION '0.1.0';
+ALTER EXTENSION pg_index_steward UPDATE;
 CREATE TABLE public.devices(id int, realm int, label text);
 INSERT INTO public.devices SELECT x, x % 31, repeat('x',140) FROM generate_series(1,35000) x;
 ANALYZE public.devices;
@@ -72,6 +73,10 @@ worker
 same "$(sql 'SELECT count(*) FROM index_steward.managed_indexes')" 0
 setting auto_create on
 reload
+sql "UPDATE index_steward.policy SET min_free_bytes=9223372036854775807" >/dev/null
+worker
+same "$(sql "SELECT count(*) FROM index_steward.jobs WHERE state='queued' AND reason='disk_headroom' AND next_attempt_at>clock_timestamp()")" 1
+sql "UPDATE index_steward.policy SET min_free_bytes=0; UPDATE index_steward.jobs SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE reason='disk_headroom'" >/dev/null
 worker
 same "$(sql 'SELECT count(*) FROM index_steward.managed_indexes WHERE retired_at IS NULL')" 1
 same "$(sql "SELECT count(*) FROM index_steward.verdicts WHERE state='observing'")" 1
@@ -93,4 +98,6 @@ worker
 same "$(sql "SELECT to_regclass('public.existing_index') IS NULL")" t
 same "$(sql "SELECT count(*) FROM index_steward.jobs WHERE action='drop' AND state='done' AND detail ? 'ddl'")" 2
 same "$(sql "SELECT to_regclass('public.other_pkey') IS NOT NULL")" t
+grep -q 'PG Index Steward .*"reason":"disk_headroom"' "$tmp/server.log"
+grep -q 'PG Index Steward .*"event":"done"' "$tmp/server.log"
 printf 'Integration passed: %s\n' "$("$pg_config" --version)"

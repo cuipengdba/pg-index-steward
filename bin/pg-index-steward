@@ -30,7 +30,9 @@ MIB = 1024 * 1024
 
 
 class DatabaseError(RuntimeError):
-    pass
+    def __init__(self, message, sqlstate=None):
+        super().__init__(message)
+        self.sqlstate = sqlstate
 
 
 def literal(value):
@@ -66,6 +68,7 @@ class Database:
             'PQfinish': (None, (ctypes.c_void_p,)),
             'PQexec': (ctypes.c_void_p, (ctypes.c_void_p, ctypes.c_char_p)),
             'PQresultStatus': (ctypes.c_int, (ctypes.c_void_p,)),
+            'PQresultErrorField': (ctypes.c_char_p, (ctypes.c_void_p, ctypes.c_int)),
             'PQntuples': (ctypes.c_int, (ctypes.c_void_p,)),
             'PQgetvalue': (ctypes.c_char_p, (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)),
             'PQclear': (None, (ctypes.c_void_p,)),
@@ -95,7 +98,8 @@ class Database:
             raise DatabaseError(self.error())
         try:
             if self.lib.PQresultStatus(result) not in (1, 2):
-                raise DatabaseError(self.error())
+                code = self.lib.PQresultErrorField(result, ord('C'))
+                raise DatabaseError(self.error(), code.decode() if code else None)
             return [self.lib.PQgetvalue(result, row, 0).decode()
                     for row in range(self.lib.PQntuples(result))]
         finally:
@@ -237,14 +241,19 @@ def covered(db, table_oid, keys):
 
 
 def upsert_job(db, action, target, signature, detail):
-    db.execute(f"""INSERT INTO {SCHEMA}.jobs(action,target,signature,detail)
-                   SELECT {literal(action)},{target},{literal(signature)},{json_value(detail)}
+    rows = db.execute(f"""WITH affected AS (INSERT INTO {SCHEMA}.jobs(action,target,signature,detail,created_at,updated_at)
+                   SELECT {literal(action)},{target},{literal(signature)},{json_value(detail)},statement_timestamp(),statement_timestamp()
                    WHERE NOT EXISTS (SELECT FROM {SCHEMA}.jobs j WHERE j.action={literal(action)}
                      AND j.target={target} AND j.signature={literal(signature)}
-                     AND j.state IN ('failed','cancelled') AND j.updated_at>clock_timestamp()-interval '7 days')
+                     AND ((j.state='failed' AND j.reason='retry_limit') OR
+                          (j.state IN ('failed','cancelled') AND j.updated_at>clock_timestamp()-interval '7 days')))
                    ON CONFLICT (action,target,signature) WHERE state IN ('queued','running')
                    DO UPDATE SET detail=excluded.detail,updated_at=clock_timestamp()
-                   WHERE jobs.state='queued'""")
+                   WHERE jobs.state='queued' RETURNING id, created_at=updated_at AS inserted)
+                   SELECT row_to_json(affected) FROM affected""")
+    added = json.loads(rows[0]) if rows else None
+    if added and added['inserted']:
+        event(db, 'queued', {'id': added['id'], 'action': action}, 'new_candidate')
 
 
 def propose_indexes(db, qstats, deltas):
@@ -356,9 +365,39 @@ def protect(db):
                   NOT EXISTS (SELECT FROM pg_replication_slots) AS no_replica_evidence""")
 
 
-def update_job(db, job, state, message):
-    db.execute(f"""UPDATE {SCHEMA}.jobs SET state={literal(state)},message={literal(message)},
-                   updated_at=clock_timestamp() WHERE id={job['id']}""")
+def event(db, name, job=None, reason=None, retry_at=None):
+    db.execute(f"SELECT {SCHEMA}.log_event({literal(name)},{job['id'] if job else 'NULL'},"
+               f"{literal(job['action'] if job else None)},{literal(reason)},{literal(retry_at)})")
+
+
+def update_job(db, job, state, message, reason=None):
+    db.execute(f"""WITH changed AS (UPDATE {SCHEMA}.jobs SET state={literal(state)},message={literal(message)},
+                   reason={literal(reason)},
+                   attempts=attempts+CASE WHEN {literal(state)}='running' THEN 1 ELSE 0 END,
+                   last_started_at=CASE WHEN {literal(state)}='running' THEN clock_timestamp() ELSE last_started_at END,
+                   updated_at=clock_timestamp() WHERE id={job['id']} RETURNING id,attempts)
+                   INSERT INTO {SCHEMA}.attempts(job_id,attempt)
+                   SELECT id,attempts FROM changed WHERE {literal(state)}='running'""")
+    event(db, state, job, reason)
+
+
+def defer_job(db, job, reason, policy, attempted=False):
+    attempts = job['attempts'] + int(attempted)
+    if attempted and attempts >= policy['retry_limit']:
+        update_job(db, job, 'failed', f'Retry limit reached ({reason})', 'retry_limit')
+        return
+    delay = 0 if reason in ('drop_disabled','create_disabled','outside_allowlist') else min(3600, 120 * (2 ** min(attempts, 5)))
+    if not delay and job['reason'] == reason:
+        return
+    rows = db.execute(f"""WITH deferred AS (UPDATE {SCHEMA}.jobs SET state='queued',
+                   message={literal(reason)},reason={literal(reason)},
+                   next_attempt_at=clock_timestamp()+make_interval(secs=>{delay}) WHERE id={job['id']}
+                   RETURNING next_attempt_at::text AS retry_at) SELECT retry_at FROM deferred""")
+    event(db, 'deferred', job, reason, rows[0])
+
+
+def retryable(error):
+    return error.sqlstate in ('55P03', '57014', '40P01', '40001', '53100')
 
 
 def fetch_index(db, schema, name, table_oid):
@@ -370,20 +409,25 @@ def fetch_index(db, schema, name, table_oid):
                 WHERE n.nspname={literal(schema)} AND ic.relname={literal(name)} AND i.indrelid={table_oid}""")
 
 
-def create_index(db, job, cfg, remaining):
+def create_index(db, job, cfg, remaining, policy):
     detail = job['detail']
     tbl = eligible_table(db, detail['schema'], detail['table'])
     if not tbl or tbl['oid'] != job['target'] or covered(db, tbl['oid'], detail['keys']):
         update_job(db, job, 'cancelled', 'Table changed or an index now covers the candidate')
         return False
-    if tbl['bytes'] < MIN_TABLE_BYTES or tbl['reltuples'] < MIN_ROWS or tbl['bytes'] > 5 * 1024 * MIB:
+    if tbl['bytes'] < MIN_TABLE_BYTES or tbl['reltuples'] < MIN_ROWS or tbl['bytes'] > policy['max_table_bytes']:
+        defer_job(db, job, 'table_size_policy', policy)
         return False
-    reserve = max(1024 * MIB, 2 * tbl['bytes'])
+    reserve = max(policy['min_free_bytes'], 2 * tbl['bytes'])
     if shutil.disk_usage(cfg['data_directory']).free < reserve:
+        defer_job(db, job, 'disk_headroom', policy)
         return False
     other = db.one(f"""SELECT EXISTS(SELECT FROM pg_stat_progress_create_index WHERE relid={tbl['oid']}) AS active""")
-    if other['active'] or fetch_index(db, detail['schema'], detail['index'], tbl['oid']):
-        update_job(db, job, 'cancelled', 'An index build is active or the generated index name already exists')
+    if other['active']:
+        defer_job(db, job, 'concurrent_build', policy)
+        return False
+    if fetch_index(db, detail['schema'], detail['index'], tbl['oid']):
+        update_job(db, job, 'failed', 'Generated index already exists; inspect its definition', 'index_name_conflict')
         return False
     qualified = relation(detail['schema'], detail['table'])
     columns = ', '.join(identifier(x) for x in detail['keys'])
@@ -408,15 +452,20 @@ def create_index(db, job, cfg, remaining):
             try:
                 db.execute("SET statement_timeout='5s'")
                 db.execute(f"DROP INDEX CONCURRENTLY {relation(detail['schema'],detail['index'])}")
+                idx = None
             except DatabaseError:
-                pass  # The failed job retains the object name for operator follow-up.
-        update_job(db, job, 'failed', str(exc)[:1000])
+                event(db, 'cleanup_failed', job, 'invalid_index')
+        if retryable(exc) and not idx:
+            defer_job(db, job, exc.sqlstate, policy, attempted=True)
+        else:
+            update_job(db, job, 'failed', f'Create failed ({exc.sqlstate or "unknown"})',
+                       'invalid_index' if idx else exc.sqlstate)
     finally:
         db.execute("SET statement_timeout='15s'")
     return True
 
 
-def drop_index(db, job, cfg, guards, remaining):
+def drop_index(db, job, cfg, guards, remaining, policy):
     rows = index_inventory(db, job['target'])
     if not rows or rows[0]['fingerprint'] != job['signature']:
         update_job(db, job, 'cancelled', 'Index identity or dependencies changed')
@@ -427,6 +476,7 @@ def drop_index(db, job, cfg, guards, remaining):
         return False
     permitted = cfg['auto_drop_managed'] if idx['managed'] else cfg['auto_drop_existing']
     if not permitted or not guards['no_replica_evidence']:
+        defer_job(db, job, 'drop_disabled' if not permitted else 'replica_usage_unverified', policy)
         return False
     if not idx['valid'] or not continuously_idle(idx) or not idx['idle_long']:
         update_job(db, job, 'cancelled', 'Idle evidence no longer qualifies')
@@ -440,7 +490,11 @@ def drop_index(db, job, cfg, guards, remaining):
                        WHERE index_oid={idx['oid']} AND fingerprint={literal(idx['fingerprint'])}""")
         update_job(db, job, 'done', 'Index retired; original DDL retained in detail')
     except DatabaseError as exc:
-        update_job(db, job, 'failed', str(exc)[:1000])
+        current = index_inventory(db, job['target'])
+        if retryable(exc) and current and current[0]['valid']:
+            defer_job(db, job, exc.sqlstate, policy, attempted=True)
+        else:
+            update_job(db, job, 'failed', f'Drop failed ({exc.sqlstate or "unknown"})', exc.sqlstate)
     finally:
         db.execute("SET statement_timeout='15s'")
     return True
@@ -473,6 +527,37 @@ def measure(db, deltas):
                        state={literal(state)},updated_at=clock_timestamp() WHERE job_id={row['job_id']}""")
 
 
+def allowed_by_policy(job, policy):
+    obj = job['detail']
+    schemas, tables = policy['allowed_schemas'], policy['allowed_tables']
+    return ((schemas is None or obj['schema'] in schemas) and
+            (tables is None or relation(obj['schema'], obj['table']) in tables))
+
+
+def recover_jobs(db, policy):
+    for job in db.rows(f"SELECT * FROM {SCHEMA}.jobs WHERE state='running'"):
+        detail = job['detail']
+        if job['action'] == 'create':
+            idx = fetch_index(db, detail['schema'], detail['index'], job['target'])
+            if idx is None:
+                defer_job(db, job, 'interrupted_before_create', policy)
+                continue
+            if idx['valid'] and db.one(f"SELECT EXISTS(SELECT FROM {SCHEMA}.managed_indexes WHERE build_job={job['id']}) AS recorded")['recorded']:
+                update_job(db, job, 'done', 'Recovered recorded index', 'reconciled')
+                continue
+        else:
+            obj = db.one(f"SELECT EXISTS(SELECT FROM pg_class WHERE oid={job['target']}) AS present")
+            if not obj['present']:
+                db.execute(f"UPDATE {SCHEMA}.managed_indexes SET retired_at=clock_timestamp() WHERE index_oid={job['target']}")
+                update_job(db, job, 'done', 'Recovered completed drop', 'reconciled')
+                continue
+            rows = index_inventory(db, job['target'])
+            if rows and rows[0]['valid'] and rows[0]['fingerprint'] == job['signature']:
+                defer_job(db, job, 'interrupted_before_drop', policy)
+                continue
+        update_job(db, job, 'failed', 'DDL interrupted; inspect object before retry', 'interrupted_catalog_review')
+
+
 def run_cycle(db, cfg, allow_ddl):
     if cfg['recovery'] or cfg['read_only']:
         return
@@ -485,34 +570,49 @@ def run_cycle(db, cfg, allow_ddl):
         except BlockingIOError:
             return
         qstats, info = extension_locations(db)
-        db.execute(f"""UPDATE {SCHEMA}.jobs SET state='failed',message='Interrupted; inspect catalog before retry',
-                         updated_at=clock_timestamp() WHERE state='running'""")
+        policy = db.one(f"SELECT * FROM {SCHEMA}.policy WHERE singleton")
+        if policy is None:
+            raise DatabaseError('Missing index_steward.policy row')
+        recover_jobs(db, policy)
         deltas = workload(db, qstats, info)
         propose_indexes(db, qstats, deltas)
         observe_indexes(db)
         measure(db, deltas)
-        if not allow_ddl:
+        if not allow_ddl or policy['paused']:
             return
         cfg = settings(db)
         remaining = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])
         if remaining <= 15:
             return
-        guards = protect(db)
-        if not guards['no_long_xact'] or not guards['replication_healthy']:
+        used = db.one(f"SELECT count(*) AS jobs FROM {SCHEMA}.attempts WHERE started_at >= date_trunc('day',clock_timestamp())")
+        if used['jobs'] >= policy['daily_limit']:
+            event(db, 'cycle_paused', reason='daily_limit')
             return
         jobs = db.rows(f"""SELECT * FROM {SCHEMA}.jobs WHERE state='queued'
-                       AND updated_at>clock_timestamp()-interval '24 hours'
-                       ORDER BY action='create' DESC, COALESCE((detail->>'score')::float8, 0) DESC,id LIMIT 50""")
+                       AND next_attempt_at<=clock_timestamp()
+                       ORDER BY (created_at<clock_timestamp()-interval '2 days') DESC,
+                                CASE WHEN created_at<clock_timestamp()-interval '2 days' THEN created_at END,
+                                action='create' DESC, COALESCE((detail->>'score')::float8, 0) DESC,id LIMIT 50""")
         for job in jobs:
             cfg = settings(db)
             remaining = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])
             if remaining <= 15:
                 return
-            if job['action'] == 'create' and cfg['auto_create']:
-                if create_index(db, job, cfg, remaining):
+            if not allowed_by_policy(job, policy):
+                defer_job(db, job, 'outside_allowlist', policy)
+                continue
+            guards = protect(db)
+            if not guards['no_long_xact'] or not guards['replication_healthy']:
+                reason = 'long_transaction' if not guards['no_long_xact'] else 'replication_lag'
+                defer_job(db, job, reason, policy)
+                continue
+            if job['action'] == 'create':
+                if not cfg['auto_create']:
+                    defer_job(db, job, 'create_disabled', policy)
+                elif create_index(db, job, cfg, remaining, policy):
                     return
             elif job['action'] == 'drop':
-                if drop_index(db, job, cfg, guards, remaining):
+                if drop_index(db, job, cfg, guards, remaining, policy):
                     return
 
 
@@ -532,7 +632,13 @@ def main():
             db = Database(args.libpq, args.conninfo)
             run_cycle(db, settings(db), not args.observe_only)
         except (DatabaseError, OSError, ValueError) as exc:
-            print(f'{dt.datetime.now().isoformat(timespec="seconds")} stewardship cycle failed: {exc}', file=sys.stderr)
+            reason = getattr(exc, 'sqlstate', None) or type(exc).__name__
+            if db:
+                try:
+                    event(db, 'cycle_failed', reason=reason)
+                except DatabaseError:
+                    pass
+            print(f'{dt.datetime.now().isoformat(timespec="seconds")} stewardship cycle failed ({reason})', file=sys.stderr)
             if args.once:
                 return 1
         finally:

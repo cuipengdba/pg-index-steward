@@ -101,7 +101,9 @@ PY
     }
     atomic_install "$module" "$pkglibdir/pg_index_steward.so" 0755
     atomic_install "$base/pg_index_steward.control" "$sharedir/extension/pg_index_steward.control" 0644
-    atomic_install "$base/sql/pg_index_steward--0.1.0.sql" "$sharedir/extension/pg_index_steward--0.1.0.sql" 0644
+    for sql_file in "$base"/sql/pg_index_steward--*.sql; do
+        atomic_install "$sql_file" "$sharedir/extension/${sql_file##*/}" 0644
+    done
     atomic_install "$base/bin/pg-index-steward" "$bindir/pg-index-steward" 0755
 fi
 

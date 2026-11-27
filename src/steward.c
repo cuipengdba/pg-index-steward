@@ -1,6 +1,8 @@
 #include "postgres.h"
+#include "commands/dbcommands.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "parser/parser.h"
 #include "utils/builtins.h"
@@ -8,7 +10,7 @@
 #include "utils/json.h"
 
 #if PG_VERSION_NUM >= 190000
-PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.1.0");
+PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.2.0");
 #else
 PG_MODULE_MAGIC;
 #endif
@@ -225,4 +227,30 @@ steward_candidates(PG_FUNCTION_ARGS)
 	}
 	appendStringInfoChar(&result, ']');
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(result.data)));
+}
+
+PG_FUNCTION_INFO_V1(steward_log_event);
+Datum
+steward_log_event(PG_FUNCTION_ARGS)
+{
+	StringInfoData payload;
+	const char *keys[] = {"event", "action", "reason", "retry_at"};
+	const int args[] = {0, 2, 3, 4};
+	int i;
+
+	initStringInfo(&payload);
+	appendStringInfoString(&payload, "{\"database\":");
+	escape_json(&payload, get_database_name(MyDatabaseId));
+	if (!PG_ARGISNULL(1))
+		appendStringInfo(&payload, ",\"job_id\":" INT64_FORMAT, PG_GETARG_INT64(1));
+	for (i = 0; i < lengthof(args); i++)
+	{
+		if (PG_ARGISNULL(args[i]))
+			continue;
+		appendStringInfo(&payload, ",\"%s\":", keys[i]);
+		escape_json(&payload, text_to_cstring(PG_GETARG_TEXT_PP(args[i])));
+	}
+	appendStringInfoChar(&payload, '}');
+	ereport(LOG, (errmsg_internal("PG Index Steward %s", payload.data), errhidestmt(true)));
+	PG_RETURN_VOID();
 }
