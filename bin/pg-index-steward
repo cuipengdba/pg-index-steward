@@ -148,6 +148,8 @@ def usage_counters(db, qstats, info):
     return db.rows(f"""SELECT s.userid, s.queryid, s.toplevel, s.calls,
                               s.total_exec_time AS elapsed, s.shared_blks_read AS reads,
                               s.shared_blks_hit AS hits, s.temp_blks_written AS temporary,
+                              s.total_plan_time AS planning, s.plans, s.rows AS result_rows,
+                              s.wal_bytes AS wal_bytes,
                               i.stats_reset::text AS reset_marker, i.dealloc AS dealloc,
                               to_jsonb(s)->>'stats_since' AS stats_since,
                               old.snapshot AS previous
@@ -168,17 +170,38 @@ def workload(db, qstats, info):
     for row in usage_counters(db, qstats, info):
         old = row.pop('previous')
         snapshots.append((row['userid'], row['queryid'], row['toplevel'], row))
-        if not old or any(old[k] != row[k] for k in ('reset_marker', 'dealloc', 'stats_since')):
+        if not old or any(old.get(k) != row[k] for k in ('reset_marker', 'dealloc', 'stats_since')):
             continue
         counters = ('calls', 'elapsed', 'reads', 'hits', 'temporary')
         delta = {k: row[k] - old[k] for k in counters}
         if delta['calls'] > 0 and min(delta.values()) >= 0:
+            for k in ('planning', 'plans', 'result_rows', 'wal_bytes'):
+                delta[k] = max(0, row[k] - old.get(k, row[k]))
             changes.append({**row, **delta})
     if snapshots:
         values = ','.join(f'({u}::oid,{q}::bigint,{literal(top)},{json_value(v)})' for u, q, top, v in snapshots)
         db.execute(f"""INSERT INTO {SCHEMA}.workload VALUES {values}
                         ON CONFLICT (userid,queryid,toplevel) DO UPDATE SET snapshot=excluded.snapshot""")
     return sorted(changes, key=lambda x: x['elapsed'], reverse=True)
+
+
+def record_diagnostics(db, deltas):
+    values = []
+    for delta in deltas:
+        category = ('spill' if delta['temporary'] > 0 else
+                    'planning' if delta['planning'] > delta['elapsed'] / 2 else
+                    'nested' if not delta['toplevel'] else
+                    'frequent_lookup' if delta['result_rows'] <= delta['calls'] and delta['calls'] >= MIN_CALLS else 'execution')
+        values.append(f"({int(delta['userid'])}::oid,{delta['queryid']}::bigint,{literal(delta['toplevel'])},"
+             + ','.join(['clock_timestamp()', str(delta['elapsed']), str(delta['planning']),
+             str(delta['calls']), str(delta['plans']), str(delta['reads'] + delta['hits']),
+             str(delta['temporary']), literal(category)]) + ')')
+    if values:
+        db.execute(f"""INSERT INTO {SCHEMA}.query_diagnostics VALUES {','.join(values)}
+                       ON CONFLICT(userid,queryid,toplevel) DO UPDATE SET
+                       sampled_at=excluded.sampled_at,elapsed_ms=excluded.elapsed_ms,
+                       planning_ms=excluded.planning_ms,calls=excluded.calls,plans=excluded.plans,
+                       shared_blocks=excluded.shared_blocks,temp_blocks=excluded.temp_blocks,category=excluded.category""")
 
 
 def eligible_table(db, schema, name):
@@ -575,6 +598,7 @@ def run_cycle(db, cfg, allow_ddl):
             raise DatabaseError('Missing index_steward.policy row')
         recover_jobs(db, policy)
         deltas = workload(db, qstats, info)
+        record_diagnostics(db, deltas)
         propose_indexes(db, qstats, deltas)
         observe_indexes(db)
         measure(db, deltas)

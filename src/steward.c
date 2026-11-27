@@ -10,7 +10,7 @@
 #include "utils/json.h"
 
 #if PG_VERSION_NUM >= 190000
-PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.2.0");
+PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "0.3.0");
 #else
 PG_MODULE_MAGIC;
 #endif
