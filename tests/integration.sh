@@ -120,4 +120,18 @@ if [[ $(sql "SELECT to_regprocedure('index_steward.approve_rollback(bigint)') IS
 fi
 grep -q 'PG Index Steward .*"reason":"disk_headroom"' "$tmp/server.log"
 grep -q 'PG Index Steward .*"event":"done"' "$tmp/server.log"
+if [[ $(sql "SELECT to_regprocedure('index_steward.queue_partition_index(regclass,name[])') IS NOT NULL") == t ]]; then
+    psql -q <<'SQL'
+UPDATE index_steward.policy SET paused=false, daily_limit=25;
+CREATE TABLE public.events (id int, day int) PARTITION BY RANGE(day);
+CREATE TABLE public.events_a PARTITION OF public.events FOR VALUES FROM (0) TO (10);
+CREATE TABLE public.events_b PARTITION OF public.events FOR VALUES FROM (10) TO (20);
+SELECT index_steward.queue_partition_index('public.events', ARRAY['id']::name[]);
+SQL
+    worker
+    same "$(sql "SELECT indisvalid FROM pg_index WHERE indrelid='public.events'::regclass")" f
+    for _ in {1..5}; do worker; done
+    same "$(sql "SELECT indisvalid FROM pg_index WHERE indrelid='public.events'::regclass")" t
+    same "$(sql "SELECT state FROM index_steward.jobs WHERE target='public.events'::regclass")" done
+fi
 printf 'Integration passed: %s\n' "$("$pg_config" --version)"

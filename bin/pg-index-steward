@@ -526,8 +526,91 @@ def fetch_index(db, schema, name, table_oid):
                 WHERE n.nspname={literal(schema)} AND ic.relname={literal(name)} AND i.indrelid={table_oid}""")
 
 
+def partition_children(db, parent):
+    return db.rows(f"""SELECT c.oid,n.nspname AS schema,c.relname AS table,c.relkind,
+        c.relpersistence,c.relrowsecurity,c.reltablespace::bigint AS reltablespace,pg_relation_size(c.oid) AS bytes
+        FROM pg_inherits h JOIN pg_class c ON c.oid=h.inhrelid
+        JOIN pg_namespace n ON n.oid=c.relnamespace WHERE h.inhparent={parent}
+        ORDER BY c.oid""")
+
+
+def partition_step(db, job, cfg, remaining, policy):
+    detail = job['detail']
+    target = job['target']
+    parent = db.one(f"""SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE c.oid={target} AND c.relname={literal(detail['table'])} AND n.nspname={literal(detail['schema'])}
+          AND c.relkind='p' AND NOT c.relispartition AND NOT c.relrowsecurity""")
+    if not parent or extension_managed(db, target, detail['schema'], detail['table']):
+        update_job(db, job, 'cancelled', 'Partitioned table identity changed', 'partition_identity')
+        return False
+    children = partition_children(db, target)
+    if not children or any(child['relkind'] != 'r' or child['relpersistence'] != 'p' or
+                           child['relrowsecurity'] or child['reltablespace'] or
+                           not allowed_by_policy({'detail': child}, policy) for child in children):
+        update_job(db, job, 'failed', 'Requires one level of permanent ordinary partitions', 'partition_shape')
+        return False
+    qualified = relation(detail['schema'], detail['table'])
+    columns = ', '.join(identifier(name) for name in detail['keys'])
+    index_name = relation(detail['schema'], detail['index'])
+    index = fetch_index(db, detail['schema'], detail['index'], target)
+    if index and index['valid']:
+        update_job(db, job, 'done', 'Parent index is valid', 'partition_complete')
+        return False
+    if index is None and covered(db, target, detail['keys']):
+        update_job(db, job, 'cancelled', 'A parent index covers the candidate', 'already_covered')
+        return False
+    if index is None:
+        if any(child['bytes'] > policy['max_table_bytes'] for child in children):
+            defer_job(db, job, 'partition_size_policy', policy)
+            return False
+        sql = f"CREATE INDEX {identifier(detail['index'])} ON ONLY {qualified} USING btree ({columns})"
+        stage = 'partition_parent'
+    else:
+        attached = {r['table_oid'] for r in db.rows(f"""SELECT i.indrelid AS table_oid
+            FROM pg_inherits h JOIN pg_index i ON i.indexrelid=h.inhrelid WHERE h.inhparent={index['oid']}""")}
+        child = next((row for row in children if row['oid'] not in attached), None)
+        if child is None:
+            defer_job(db, job, 'partition_catalog_changed', policy)
+            return False
+        child_name = f"{detail['index']}_{child['oid']}"
+        child_index = fetch_index(db, child['schema'], child_name, child['oid'])
+        if child_index and not child_index['valid']:
+            update_job(db, job, 'failed', 'Inspect invalid partition index before retry', 'partition_child_invalid')
+            return False
+        if child_index:
+            sql = f"ALTER INDEX {index_name} ATTACH PARTITION {relation(child['schema'], child_name)}"
+            stage = 'partition_attached'
+        else:
+            if child['bytes'] > policy['max_table_bytes']:
+                defer_job(db, job, 'partition_size_policy', policy)
+                return False
+            reserve = max(policy['min_free_bytes'], 2 * child['bytes'])
+            if shutil.disk_usage(cfg['data_directory']).free < reserve:
+                defer_job(db, job, 'disk_headroom', policy)
+                return False
+            sql = (f"CREATE INDEX CONCURRENTLY {identifier(child_name)} ON "
+                   f"{relation(child['schema'], child['table'])} USING btree ({columns})")
+            stage = 'partition_child'
+    update_job(db, job, 'running', 'Partition index step started', stage)
+    try:
+        db.execute(f"SET statement_timeout='{min(remaining-5, 1800)}s'")
+        db.execute(sql)
+        db.execute(f"UPDATE {SCHEMA}.jobs SET state='queued',reason={literal(stage)},next_attempt_at='-infinity' WHERE id={job['id']}")
+        event(db, 'step_completed', job, stage)
+    except DatabaseError as error:
+        if retryable(error):
+            defer_job(db, job, error.sqlstate, policy, attempted=True)
+        else:
+            update_job(db, job, 'failed', 'Partition index step failed', error.sqlstate)
+    finally:
+        db.execute("SET statement_timeout='15s'")
+    return True
+
+
 def create_index(db, job, cfg, remaining, policy):
     detail = job['detail']
+    if detail.get('partition'):
+        return partition_step(db, job, cfg, remaining, policy)
     tbl = eligible_table(db, detail['schema'], detail['table'])
     if not tbl or tbl['oid'] != job['target'] or covered(db, tbl['oid'], detail['keys']):
         update_job(db, job, 'cancelled', 'Table changed or an index now covers the candidate')
@@ -676,6 +759,9 @@ def allowed_by_policy(job, policy):
 def recover_jobs(db, policy):
     for job in db.rows(f"SELECT * FROM {SCHEMA}.jobs WHERE state='running'"):
         detail = job['detail']
+        if detail.get('partition'):
+            defer_job(db, job, 'interrupted_partition_step', policy)
+            continue
         if job['action'] == 'create':
             idx = fetch_index(db, detail['schema'], detail['index'], job['target'])
             if idx is None:
