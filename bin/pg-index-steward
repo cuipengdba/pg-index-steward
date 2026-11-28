@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.15.0'
+VERSION = '3.16.0'
 
 
 class DatabaseError(RuntimeError):
@@ -1470,7 +1470,71 @@ def retire_timescale_index(db, job, guards, policy):
     return True
 
 
-def hypercore_configure(db, job, policy):
+def hypercore_rebuild(db, job, cfg, budget, policy):
+    detail = job['detail']
+    table = relation(detail['schema'], detail['table'])
+    parent = int(job['target'])
+    target = timescale_inventory(db, job)
+    if not target or target['distributed'] or target['tablespace'] or target['external_tablespace']:
+        update_job(db, job, 'cancelled', 'Hypertable layout changed', 'hypercore_identity')
+        return False
+    chunk = db.one(f"""SELECT c.oid,n.nspname AS schema_name,c.relname AS chunk_name,
+        pg_total_relation_size(s.compress_relid) AS bytes, c.relfilenode
+        FROM timescaledb_information.chunk_columnstore_settings v
+        JOIN pg_class c ON c.oid=v.chunk JOIN pg_namespace n ON n.oid=c.relnamespace
+        JOIN _timescaledb_catalog.compression_settings s ON s.relid=c.oid
+        JOIN pg_inherits h ON h.inhrelid=c.oid AND h.inhparent={parent}
+        WHERE v.hypertable={parent} AND v.index IS DISTINCT FROM {json_value(detail['after']['sparse_indexes'])}
+        ORDER BY c.oid LIMIT 1""")
+    if not chunk:
+        actual = db.one(f"SELECT {SCHEMA}.hypercore_settings({parent}::regclass) AS config")['config']
+        if actual == detail['after']:
+            update_job(db, job, 'done', 'Columnstore chunk settings match the approved configuration', 'hypercore_rebuild_complete')
+        else:
+            update_job(db, job, 'cancelled', 'Hypertable configuration changed before completion', 'hypercore_identity')
+        return False
+    if chunk['bytes'] > policy['max_table_bytes']:
+        defer_job(db, job, 'table_size_policy', policy)
+        return False
+    if shutil.disk_usage(cfg['data_directory']).free < max(policy['min_free_bytes'], 2 * chunk['bytes']):
+        defer_job(db, job, 'disk_headroom', policy)
+        return False
+    child = relation(chunk['schema_name'], chunk['chunk_name'])
+    update_job(db, job, 'running', 'Rebuilding sparse indexes on one columnstore chunk', 'hypercore_chunk_rebuild')
+    try:
+        db.execute('BEGIN')
+        db.execute(f"SET LOCAL statement_timeout='{budget}s'")
+        db.execute(f'LOCK TABLE ONLY {table} IN SHARE UPDATE EXCLUSIVE MODE')
+        db.execute(f'LOCK TABLE ONLY {child} IN ACCESS EXCLUSIVE MODE')
+        valid = db.one(f"""SELECT to_regclass({literal(table)})::oid={parent}
+            AND {SCHEMA}.hypercore_settings({parent}::regclass)={json_value(detail['after'])}
+            AND EXISTS(SELECT FROM pg_inherits h JOIN pg_class c ON c.oid=h.inhrelid
+                WHERE h.inhparent={parent} AND h.inhrelid={chunk['oid']}
+                AND c.oid=to_regclass({literal(child)}) AND c.relfilenode={chunk['relfilenode']}) AS valid""")['valid']
+        if not valid:
+            db.execute('ROLLBACK')
+            defer_job(db, job, 'hypercore_catalog_changed', policy, attempted=True)
+            return True
+        db.execute(f"SELECT _timescaledb_functions.rebuild_sparse_index({chunk['oid']}::regclass,false)")
+        if not db.one(f"""SELECT EXISTS(SELECT FROM timescaledb_information.chunk_columnstore_settings
+            WHERE chunk={chunk['oid']} AND index={json_value(detail['after']['sparse_indexes'])}) AS ready""")['ready']:
+            raise DatabaseError('Sparse metadata does not match after rebuild', '55000')
+        db.execute(f"""UPDATE {SCHEMA}.jobs SET state='queued',reason='hypercore_chunk_complete',retry_streak=0,
+            next_attempt_at='-infinity',updated_at=clock_timestamp(),
+            detail=jsonb_set(detail,'{{completed_chunks}}',(detail->'completed_chunks')||to_jsonb({chunk['oid']}::oid))
+            WHERE id={job['id']}""")
+        db.execute('COMMIT')
+        event(db, 'step_completed', job, 'hypercore_chunk_complete')
+    except DatabaseError as error:
+        db.execute('ROLLBACK')
+        if retryable(error) or error.sqlstate == '42P01':
+            defer_job(db, job, error.sqlstate, policy, attempted=True)
+        else:
+            update_job(db, job, 'failed', 'Columnstore chunk rebuild requires review', error.sqlstate)
+    return True
+
+
+def hypercore_configure(db, job, cfg, policy):
     detail = job['detail']
     pair = db.one(f"SELECT * FROM {SCHEMA}.timescale_pair_status()")
     if not pair or pair['support'] != 'production' or pair['timescaledb_version'] != '2.32.1':
@@ -1479,6 +1543,8 @@ def hypercore_configure(db, job, policy):
     budget = ddl_budget(db, policy, job)
     if not budget:
         return False
+    if detail.get('step') == 'rebuild':
+        return hypercore_rebuild(db, job, cfg, budget, policy)
     table = relation(detail['schema'], detail['table'])
     sparse = f"bloom({identifier(detail['bloom'])}), minmax({identifier(detail['minmax'])})"
     update_job(db, job, 'running', 'Applying sparse index settings', 'hypercore_sparse')
@@ -1515,7 +1581,7 @@ def hypercore_configure(db, job, policy):
 def create_index(db, job, cfg, remaining, policy):
     detail = job['detail']
     if detail.get('hypercore'):
-        return hypercore_configure(db, job, policy)
+        return hypercore_configure(db, job, cfg, policy)
     if detail.get('timescale'):
         return timescale_create(db, job, cfg, policy)
     if detail.get('partition'):

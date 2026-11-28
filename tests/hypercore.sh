@@ -71,8 +71,11 @@ sql -c "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) $range" > "$tmp/range-before.jso
 sql -c "UPDATE index_steward.policy SET hypercore_changes=true,min_free_bytes=0; SELECT index_steward.queue_hypercore_sparse('public.telemetry','payload','reading')"
 worker
 same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE id=1")" done:hypercore_sparse_applied
-sql -c "SELECT decompress_chunk(c) FROM show_chunks('public.telemetry') c"
-sql -c "SELECT compress_chunk(c) FROM show_chunks('public.telemetry') c"
+sql -c "SELECT index_steward.queue_hypercore_rebuild('public.telemetry')"
+worker
+same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE id=2")" queued:hypercore_chunk_complete
+worker
+same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE id=2")" done:hypercore_rebuild_complete
 same "$(sql -c "$point")" "$point_before"
 same "$(sql -c "$range")" "$range_before"
 sql -c "SELECT s.index FROM timescaledb_information.chunk_columnstore_settings s WHERE hypertable='public.telemetry'::regclass" | grep -q 'bloom'
