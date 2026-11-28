@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.2.0'
+VERSION = '3.3.0'
 
 
 class DatabaseError(RuntimeError):
@@ -1010,13 +1010,14 @@ def propose_timescale(db, deltas, policy):
             upsert_job(db, 'create', target['oid'], signature, detail)
 
 
-def timescale_coverage(db, job):
+def timescale_definition_indexes(db, job):
     detail = job['detail']
-    if timescale_mode(db) == 'definition':
-        return db.one(f"""SELECT count(*) AS chunks,count(*) FILTER (WHERE EXISTS (
-           SELECT FROM pg_index i JOIN pg_class ci ON ci.oid=i.indexrelid
+    return db.rows(f"""SELECT h.inhrelid AS chunk_oid, ci.oid,ci.relname AS name,i.indisvalid AND i.indisready AS valid,
+             child.relname AS chunk_name
+           FROM pg_inherits h JOIN pg_class child ON child.oid=h.inhrelid
+           JOIN pg_index i ON i.indrelid=child.oid JOIN pg_class ci ON ci.oid=i.indexrelid
            JOIN pg_am am ON am.oid=ci.relam
-           WHERE i.indrelid=h.inhrelid AND i.indisvalid AND i.indisready AND i.indislive
+           WHERE h.inhparent={job['target']} AND i.indislive
              AND i.indnkeyatts=i.indnatts AND i.indnatts={len(detail['keys'])}
              AND NOT i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL
              AND am.amname={literal(detail['method'])}
@@ -1025,7 +1026,14 @@ def timescale_coverage(db, job):
                         JOIN pg_opclass op ON op.oid=i.indclass[k.pos::int-1] AND op.opcdefault
                         WHERE i.indcollation[k.pos::int-1]=a.attcollation AND i.indoption[k.pos::int-1]=0
                         ORDER BY k.pos)=ARRAY[{','.join(literal(key) for key in detail['keys'])}]::text[]
-        )) AS indexed FROM pg_inherits h WHERE h.inhparent={job['target']}""")
+        """)
+
+
+def timescale_coverage(db, job):
+    detail = job['detail']
+    if timescale_mode(db) == 'definition':
+        chunks = db.one(f"SELECT count(*) AS chunks FROM pg_inherits WHERE inhparent={job['target']}")['chunks']
+        return {'chunks': chunks, 'indexed': len({r['chunk_oid'] for r in timescale_definition_indexes(db, job) if r['valid']})}
     return db.one(f"""SELECT count(*) AS chunks,count(*) FILTER (WHERE EXISTS (
         SELECT FROM _timescaledb_catalog.chunk ch
         JOIN _timescaledb_catalog.chunk_index m ON m.chunk_id=ch.id AND m.hypertable_id=ch.hypertable_id
@@ -1080,9 +1088,7 @@ def timescale_reconcile(db, job, index, policy):
     if index['valid']:
         update_job(db, job, 'failed', 'Inspect valid root with incomplete chunk coverage', 'timescale_coverage')
         return False
-    if timescale_mode(db) == 'definition':
-        update_job(db, job, 'failed', 'Invalid root requires inspection of equivalent chunk indexes', 'timescale_definition_review')
-        return False
+    definition_mode = timescale_mode(db) == 'definition'
     budget = ddl_budget(db, policy, job)
     if not budget:
         return False
@@ -1090,7 +1096,8 @@ def timescale_reconcile(db, job, index, policy):
     try:
         db.execute('BEGIN')
         db.execute(f"SET LOCAL statement_timeout='{min(15, budget)}s'")
-        db.execute(f"LOCK TABLE ONLY {relation(detail['schema'], detail['table'])} IN SHARE UPDATE EXCLUSIVE MODE")
+        only = '' if definition_mode else 'ONLY '
+        db.execute(f"LOCK TABLE {only}{relation(detail['schema'], detail['table'])} IN SHARE ROW EXCLUSIVE MODE")
         locked_target = db.one(f"SELECT to_regclass({literal(relation(detail['schema'], detail['table']))})::oid AS oid")
         if locked_target['oid'] != job['target']:
             db.execute('ROLLBACK')
@@ -1102,6 +1109,18 @@ def timescale_reconcile(db, job, index, policy):
             db.execute('ROLLBACK')
             update_job(db, job, 'failed', 'Index changed before cleanup', 'timescale_existing_index')
             return True
+        if definition_mode:
+            matches = db.rows(f"""SELECT h.inhrelid AS chunk_oid,c.relname AS chunk_name,ci.relname AS name
+                FROM pg_inherits h JOIN pg_class c ON c.oid=h.inhrelid
+                JOIN pg_index i ON i.indrelid=c.oid JOIN pg_class ci ON ci.oid=i.indexrelid
+                WHERE h.inhparent={job['target']} AND i.indislive
+                AND _timescaledb_functions.index_matches(ci.oid,{index['oid']}::oid)""")
+            # DROP INDEX uses the same equivalence test. Every possible match must be ours.
+            if (not detail.get('definition_cleanup') or len({r['chunk_oid'] for r in matches}) != len(matches)
+                    or any(r['name'] != r['chunk_name'] + '_' + detail['index'] for r in matches)):
+                db.execute('ROLLBACK')
+                update_job(db, job, 'failed', 'Inspect ambiguous equivalent chunk indexes', 'timescale_definition_review')
+                return True
         db.execute(f"DROP INDEX {relation(detail['schema'], detail['index'])}")
         db.execute(f"UPDATE {SCHEMA}.jobs SET state='queued',reason='timescale_rebuild',"
                    f"next_attempt_at='-infinity',updated_at=clock_timestamp() WHERE id={job['id']}")
@@ -1180,7 +1199,9 @@ def timescale_create(db, job, cfg, policy):
     qualified = relation(detail['schema'], detail['table'])
     columns = ', '.join(identifier(key) for key in detail['keys'])
     # A durable per-attempt name distinguishes interrupted work from pre-existing indexes.
-    detail['index'] = detail['build_intent'] = 'pgist_' + secrets.token_hex(16)
+    # A shorter ASCII name usually fits alongside TimescaleDB's chunk name.
+    detail['index'] = detail['build_intent'] = 'pgist_' + secrets.token_hex(10)
+    detail['definition_cleanup'] = timescale_mode(db) == 'definition'
     detail['build_epoch'] = policy['primary_epoch']
     db.execute(f"UPDATE {SCHEMA}.jobs SET detail={json_value(detail)} WHERE id={job['id']}")
     update_job(db, job, 'running', 'Building hypertable index in chunk transactions', 'timescale_create')

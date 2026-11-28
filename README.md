@@ -91,7 +91,7 @@ pg_index_steward.auto_drop_managed = on
 | 16、17、18 | 2.32.1 | 正式 |
 | 19 | 2.32.1 | 上游实验构建 `-DEXPERIMENTAL=ON`，另需开启 `policy.timescale_experimental` |
 
-PG14 与 TimescaleDB 2.8.0 的混合压缩超表可开启 `policy.timescale_legacy_compression` 后显式排队。该组合的索引覆盖行存路径，压缩数据的查询由 TimescaleDB 的压缩执行路径处理。新版按索引定义核对覆盖，中断后留下无效根索引的任务进入人工审查。
+PG14 与 TimescaleDB 2.8.0 的混合压缩超表可开启 `policy.timescale_legacy_compression` 后显式排队。该组合的索引覆盖行存路径，压缩数据的查询由 TimescaleDB 的压缩执行路径处理。新版按索引定义核对覆盖。中断后若所有等价块索引的归属均能确认，执行器在维护窗口清理无效根索引并安排重建。归属不明确时进入人工审查。
 
 主备切换后，执行器在 `failover_grace_seconds` 到期后重新核对超表索引。任务记录和索引需要已回放到新主库。隔离测试先停止旧主库，再提升物理备库并验证待恢复索引的全量覆盖。生产的旧主库隔离由高可用系统处理。
 

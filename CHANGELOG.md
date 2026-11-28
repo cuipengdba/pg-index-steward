@@ -1,4 +1,8 @@
-# PG Index Steward 3.2.0
+# PG Index Steward 3.3.0
+
+- 新版 TimescaleDB 在块锁解除后核对无效根索引及相关块索引，再清理并重建。等价索引归属不明确时转入审查。
+
+## 3.2.0
 
 - TimescaleDB 行存超表建索引覆盖 PostgreSQL 14–19 上的指定组合。PG19 组合通过上游实验构建启用。
 

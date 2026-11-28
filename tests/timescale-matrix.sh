@@ -51,4 +51,21 @@ same "$(sql -c "SELECT string_agg(a.amname,',' ORDER BY a.amname) FROM pg_index 
 plan=$(sql -c "EXPLAIN $query")
 [[ $plan == *pgist_* ]]
 same "$(sql -c "$query")" "$before"
+sql -c "SELECT index_steward.queue_timescale_index('public.matrix_events',ARRAY['device','reading']::name[])"
+chunk=$(sql -c "SELECT show_chunks('public.matrix_events') LIMIT 1")
+coproc locker { sql; }
+lock_pid=$locker_PID
+exec {lock_input}>&"${locker[1]}" {lock_output}<&"${locker[0]}"
+printf '%s\n' 'BEGIN;' "LOCK $chunk IN SHARE UPDATE EXCLUSIVE MODE;" "SELECT 'locked';" >&"$lock_input"
+read -r -t 10 -u "$lock_output" locked
+same "$locked" locked
+worker
+same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE id=3")" queued:55P03
+printf '%s\n' 'ROLLBACK;' '\q' >&"$lock_input"
+wait "$lock_pid"
+sleep 1.1
+worker
+same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE id=3")" queued:timescale_rebuild
+worker
+same "$(sql -c "SELECT state||':'||(detail->'coverage'->>'indexed') FROM index_steward.jobs WHERE id=3")" done:4
 printf 'Verified B-tree and BRIN on %s with TimescaleDB %s\n' "$("$cfg" --version)" "$version"
