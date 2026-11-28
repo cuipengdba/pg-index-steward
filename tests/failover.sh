@@ -33,7 +33,7 @@ sql <<'SQL'
 CREATE EXTENSION pg_stat_statements;
 CREATE EXTENSION pg_index_steward VERSION '1.0.0';
 INSERT INTO index_steward.jobs(action,target,signature,detail) VALUES('create','pg_class'::regclass,'upgrade-fixture','{}');
-ALTER EXTENSION pg_index_steward UPDATE TO '2.0.0';
+ALTER EXTENSION pg_index_steward UPDATE;
 CREATE TABLE public.mixed(id int, payload text);
 INSERT INTO public.mixed SELECT i,repeat('a',200) FROM generate_series(1,30000) AS i;
 ANALYZE public.mixed;
