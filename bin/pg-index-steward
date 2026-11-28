@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.16.0'
+VERSION = '3.17.0'
 
 
 class DatabaseError(RuntimeError):
@@ -56,6 +56,10 @@ def json_value(value):
 
 def identifier(name):
     return '"' + name.replace('"', '""') + '"'
+
+
+def ddl_value(value):
+    return "E'" + value.replace('\\', '\\\\').replace("'", "''") + "'"
 
 
 def relation(schema, name):
@@ -1474,6 +1478,12 @@ def hypercore_rebuild(db, job, cfg, budget, policy):
     detail = job['detail']
     table = relation(detail['schema'], detail['table'])
     parent = int(job['target'])
+    layout = detail.get('step') == 'layout_rebuild'
+    desired = detail['after']
+    mismatch = f"v.index IS DISTINCT FROM {json_value(desired['sparse_indexes'])}"
+    if layout:
+        mismatch += (f" OR v.segmentby IS DISTINCT FROM {literal(desired['segmentby'])}"
+                     f" OR v.orderby IS DISTINCT FROM {literal(desired['orderby'])}")
     target = timescale_inventory(db, job)
     if not target or target['distributed'] or target['tablespace'] or target['external_tablespace']:
         update_job(db, job, 'cancelled', 'Hypertable layout changed', 'hypercore_identity')
@@ -1484,7 +1494,7 @@ def hypercore_rebuild(db, job, cfg, budget, policy):
         JOIN pg_class c ON c.oid=v.chunk JOIN pg_namespace n ON n.oid=c.relnamespace
         JOIN _timescaledb_catalog.compression_settings s ON s.relid=c.oid
         JOIN pg_inherits h ON h.inhrelid=c.oid AND h.inhparent={parent}
-        WHERE v.hypertable={parent} AND v.index IS DISTINCT FROM {json_value(detail['after']['sparse_indexes'])}
+        WHERE v.hypertable={parent} AND ({mismatch})
         ORDER BY c.oid LIMIT 1""")
     if not chunk:
         actual = db.one(f"SELECT {SCHEMA}.hypercore_settings({parent}::regclass) AS config")['config']
@@ -1515,10 +1525,15 @@ def hypercore_rebuild(db, job, cfg, budget, policy):
             db.execute('ROLLBACK')
             defer_job(db, job, 'hypercore_catalog_changed', policy, attempted=True)
             return True
-        db.execute(f"SELECT _timescaledb_functions.rebuild_sparse_index({chunk['oid']}::regclass,false)")
-        if not db.one(f"""SELECT EXISTS(SELECT FROM timescaledb_information.chunk_columnstore_settings
-            WHERE chunk={chunk['oid']} AND index={json_value(detail['after']['sparse_indexes'])}) AS ready""")['ready']:
-            raise DatabaseError('Sparse metadata does not match after rebuild', '55000')
+        if layout:
+            ts_schema = db.one("SELECT e.extnamespace::regnamespace::text AS ns FROM pg_extension e WHERE e.extname='timescaledb'")['ns']
+            db.execute(f"SELECT {ts_schema}.decompress_chunk({chunk['oid']}::regclass)")
+            db.execute(f"SELECT {ts_schema}.compress_chunk({chunk['oid']}::regclass)")
+        else:
+            db.execute(f"SELECT _timescaledb_functions.rebuild_sparse_index({chunk['oid']}::regclass,false)")
+        if not db.one(f"""SELECT EXISTS(SELECT FROM timescaledb_information.chunk_columnstore_settings v
+            WHERE chunk={chunk['oid']} AND NOT ({mismatch})) AS ready""")['ready']:
+            raise DatabaseError('Columnstore metadata does not match after rebuild', '55000')
         db.execute(f"""UPDATE {SCHEMA}.jobs SET state='queued',reason='hypercore_chunk_complete',retry_streak=0,
             next_attempt_at='-infinity',updated_at=clock_timestamp(),
             detail=jsonb_set(detail,'{{completed_chunks}}',(detail->'completed_chunks')||to_jsonb({chunk['oid']}::oid))
@@ -1543,11 +1558,17 @@ def hypercore_configure(db, job, cfg, policy):
     budget = ddl_budget(db, policy, job)
     if not budget:
         return False
-    if detail.get('step') == 'rebuild':
+    if detail.get('step') in ('rebuild', 'layout_rebuild'):
         return hypercore_rebuild(db, job, cfg, budget, policy)
     table = relation(detail['schema'], detail['table'])
-    sparse = f"bloom({identifier(detail['bloom'])}), minmax({identifier(detail['minmax'])})"
-    update_job(db, job, 'running', 'Applying sparse index settings', 'hypercore_sparse')
+    layout = detail.get('step') == 'layout'
+    if layout:
+        options = (f"timescaledb.segmentby={ddl_value(identifier(detail['segmentby']))},"
+                   f"timescaledb.orderby={ddl_value(identifier(detail['orderby']))}")
+    else:
+        sparse = f"bloom({identifier(detail['bloom'])}), minmax({identifier(detail['minmax'])})"
+        options = f'timescaledb.compress_index={ddl_value(sparse)}'
+    update_job(db, job, 'running', 'Applying columnstore settings', 'hypercore_layout' if layout else 'hypercore_sparse')
     try:
         db.execute('BEGIN')
         db.execute(f"SET LOCAL statement_timeout='{min(15, budget)}s'")
@@ -1559,15 +1580,21 @@ def hypercore_configure(db, job, cfg, policy):
             update_job(db, job, 'cancelled', 'Hypertable layout changed before applying settings', 'hypercore_identity')
             return True
         # Preserve existing explicit sparse definitions, including composite definitions.
-        if any(entry.get('source') == 'config' for entry in (before.get('sparse_indexes') or [])):
+        if not layout and any(entry.get('source') == 'config' for entry in (before.get('sparse_indexes') or [])):
             db.execute('ROLLBACK')
             update_job(db, job, 'cancelled', 'Existing sparse definitions require manual review', 'hypercore_existing_sparse')
             return True
-        value = "E'" + sparse.replace('\\', '\\\\').replace("'", "''") + "'"
-        db.execute(f"ALTER TABLE {table} SET (timescaledb.compress_index = {value})")
+        db.execute(f"ALTER TABLE {table} SET ({options})")
         after = db.one(f"SELECT {SCHEMA}.hypercore_settings({job['target']}::regclass) AS config")['config']
-        db.execute(f"UPDATE {SCHEMA}.jobs SET detail=detail||jsonb_build_object('after',{json_value(after)}) WHERE id={job['id']}")
-        update_job(db, job, 'done', 'Sparse settings applied to future columnstore conversions', 'hypercore_sparse_applied')
+        progress = {'after': after}
+        if layout:
+            progress.update(step='layout_rebuild', completed_chunks=[])
+        db.execute(f"UPDATE {SCHEMA}.jobs SET detail=detail||{json_value(progress)} WHERE id={job['id']}")
+        if layout:
+            db.execute(f"UPDATE {SCHEMA}.jobs SET state='queued',next_attempt_at='-infinity',reason='hypercore_layout_applied' WHERE id={job['id']}")
+            event(db, 'step_completed', job, 'hypercore_layout_applied')
+        else:
+            update_job(db, job, 'done', 'Sparse settings applied to future columnstore conversions', 'hypercore_sparse_applied')
         db.execute('COMMIT')
     except DatabaseError as error:
         db.execute('ROLLBACK')

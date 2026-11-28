@@ -32,10 +32,10 @@ sql <<'SQL'
 CREATE EXTENSION timescaledb;
 CREATE EXTENSION pg_stat_statements;
 CREATE EXTENSION pg_index_steward;
-CREATE TABLE public.telemetry(ts timestamptz NOT NULL, device integer, reading integer, payload text);
+CREATE TABLE public.telemetry(ts timestamptz NOT NULL, device integer, reading integer, payload text, device_group integer);
 SELECT create_hypertable('public.telemetry','ts',chunk_time_interval=>interval '1 day');
 ALTER TABLE public.telemetry SET (timescaledb.enable_columnstore=true,timescaledb.orderby='ts');
-INSERT INTO public.telemetry SELECT '2026-01-01 UTC'::timestamptz+i*interval '0.5 seconds',i,i,md5(i::text)
+INSERT INTO public.telemetry SELECT '2026-01-01 UTC'::timestamptz+i*interval '0.5 seconds',i,i,md5(i::text),i%4
   FROM generate_series(1,160000) i;
 SELECT compress_chunk(c) FROM show_chunks('public.telemetry') c;
 ANALYZE public.telemetry;
@@ -93,4 +93,15 @@ for label, baseline, measured in zip(('Bloom', 'minmax'), before, after):
     print(f'{label} execution P95: {baseline:.3f} ms -> {measured:.3f} ms ({1-measured/baseline:.1%} lower)')
 assert all(measured <= baseline * .8 for baseline, measured in zip(before, after))
 PY
+latest_before=$(sql -c 'SELECT last(reading,ts) FROM public.telemetry')
+sql -c "SELECT index_steward.queue_hypercore_layout('public.telemetry','device_group','ts')"
+worker
+same "$(sql -c "SELECT reason FROM index_steward.jobs WHERE id=3")" hypercore_layout_applied
+worker
+worker
+same "$(sql -c "SELECT state FROM index_steward.jobs WHERE id=3")" done
+same "$(sql -c "SELECT segmentby FROM timescaledb_information.chunk_columnstore_settings WHERE hypertable='public.telemetry'::regclass")" device_group
+same "$(sql -c 'SELECT last(reading,ts) FROM public.telemetry')" "$latest_before"
+same "$(sql -c "$point")" "$point_before"
+same "$(sql -c "$range")" "$range_before"
 printf 'Verified columnstore baseline on %s\n' "$("$cfg" --version)"
