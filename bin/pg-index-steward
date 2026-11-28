@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.17.0'
+VERSION = '3.18.0'
 
 
 class DatabaseError(RuntimeError):
@@ -724,7 +724,8 @@ def defer_job(db, job, reason, policy, attempted=False):
 
 def recheck_blockers(db, cfg, policy):
     jobs = db.rows(f"""SELECT * FROM {SCHEMA}.jobs WHERE state='queued'
-        AND reason IN ('55P03','long_transaction','replication_lag','disk_headroom','53100')
+        AND reason IN ('55P03','long_transaction','replication_lag','disk_headroom','53100',
+                       'hypercore_catalog_changed','hypercore_worker_interrupted')
         AND next_attempt_at>clock_timestamp() AND NOT (detail @> '{{"advisory":true}}'::jsonb)
         AND coalesce(blocker_checked_at,updated_at)<clock_timestamp()-interval '1 second'
         ORDER BY coalesce(blocker_checked_at,updated_at),id LIMIT 50""")
@@ -733,21 +734,28 @@ def recheck_blockers(db, cfg, policy):
         if reason in ('long_transaction', 'replication_lag'):
             guards = protect(db, job)
             ready = guards['no_long_xact'] and guards['replication_healthy']
+        elif reason in ('hypercore_catalog_changed','hypercore_worker_interrupted'):
+            ready = job['detail'].get('hypercore', False)
         elif reason == '55P03':
             modes = "'ShareUpdateExclusiveLock','ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock'"
             # TimescaleDB takes a write-conflicting lock on the chunk it is indexing.
             if job['detail'].get('timescale') or job['action'] == 'drop' or job['detail'].get('partition'):
                 modes += ",'RowExclusiveLock'"
+            if job['detail'].get('hypercore'):
+                modes += ",'AccessShareLock','RowShareLock','RowExclusiveLock'"
+            chunk_oid = int(job['detail'].get('active_chunk') or 0)
+            children = ' AND false' if job['detail'].get('hypercore') else ''
             ready = db.one(f"""SELECT NOT EXISTS(SELECT FROM pg_locks WHERE locktype='relation'
                 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
                 AND mode IN ({modes}) AND relation IN (
                     SELECT {target}::oid UNION SELECT indrelid FROM pg_index WHERE indexrelid={target}
-                    UNION SELECT inhrelid FROM pg_inherits WHERE inhparent={target}
+                    UNION SELECT {chunk_oid}::oid
+                    UNION SELECT inhrelid FROM pg_inherits WHERE inhparent={target}{children}
                 )) AS ready""")['ready']
         elif reason == 'disk_headroom' and not job['detail'].get('partition'):
             inventory = timescale_inventory(db, job) if job['detail'].get('timescale') and timescale_supported(db) else None
-            bytes_needed = inventory['bytes'] if inventory else db.one(f"""SELECT coalesce((SELECT
-                pg_relation_size(oid) FROM pg_class WHERE oid={target}),0) AS bytes""")['bytes']
+            bytes_needed = job['detail'].get('active_chunk_bytes') or (inventory['bytes'] if inventory else db.one(f"""SELECT coalesce((SELECT
+                pg_relation_size(oid) FROM pg_class WHERE oid={target}),0) AS bytes""")['bytes'])
             ready = shutil.disk_usage(cfg['data_directory']).free >= max(policy['min_free_bytes'], bytes_needed * 2)
         else:
             # ENOSPC can refer to another volume; partition budgets depend on the next child.
@@ -1503,6 +1511,8 @@ def hypercore_rebuild(db, job, cfg, budget, policy):
         else:
             update_job(db, job, 'cancelled', 'Hypertable configuration changed before completion', 'hypercore_identity')
         return False
+    db.execute(f"UPDATE {SCHEMA}.jobs SET detail=detail||jsonb_build_object('active_chunk',{chunk['oid']}::oid,"
+               f"'active_chunk_bytes',{chunk['bytes']}::bigint) WHERE id={job['id']}")
     if chunk['bytes'] > policy['max_table_bytes']:
         defer_job(db, job, 'table_size_policy', policy)
         return False
@@ -1536,7 +1546,8 @@ def hypercore_rebuild(db, job, cfg, budget, policy):
             raise DatabaseError('Columnstore metadata does not match after rebuild', '55000')
         db.execute(f"""UPDATE {SCHEMA}.jobs SET state='queued',reason='hypercore_chunk_complete',retry_streak=0,
             next_attempt_at='-infinity',updated_at=clock_timestamp(),
-            detail=jsonb_set(detail,'{{completed_chunks}}',(detail->'completed_chunks')||to_jsonb({chunk['oid']}::oid))
+            detail=jsonb_set(detail-ARRAY['active_chunk','active_chunk_bytes'],'{{completed_chunks}}',
+                             (detail->'completed_chunks')||to_jsonb({chunk['oid']}::oid))
             WHERE id={job['id']}""")
         db.execute('COMMIT')
         event(db, 'step_completed', job, 'hypercore_chunk_complete')
@@ -1554,6 +1565,11 @@ def hypercore_configure(db, job, cfg, policy):
     pair = db.one(f"SELECT * FROM {SCHEMA}.timescale_pair_status()")
     if not pair or pair['support'] != 'production' or pair['timescaledb_version'] != '2.32.1':
         update_job(db, job, 'failed', 'Hypercore pair requires validation', 'hypercore_version')
+        return False
+    # Let the oldest pending columnstore change finish before applying another layout.
+    if db.one(f"""SELECT EXISTS(SELECT FROM {SCHEMA}.jobs WHERE target={job['target']} AND id<{job['id']}
+        AND state IN ('queued','running') AND detail @> '{{"hypercore":true}}'::jsonb) AS busy""")['busy']:
+        defer_job(db, job, 'hypercore_change_queued', policy)
         return False
     budget = ddl_budget(db, policy, job)
     if not budget:

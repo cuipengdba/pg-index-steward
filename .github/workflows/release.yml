@@ -95,6 +95,7 @@ jobs:
             bash tests/timescale-matrix.sh "$pgconfig" "$FIXTURE_TS" "$FIXTURE_EXPERIMENTAL"
             if [[ $FIXTURE_TS == 2.32.1 && $FIXTURE_EXPERIMENTAL == OFF ]]; then
               bash tests/hypercore.sh "$pgconfig"
+              bash tests/failover.sh "$pgconfig" hypercore
             fi
           fi
 

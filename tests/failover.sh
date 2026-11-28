@@ -6,7 +6,7 @@ bin=$("$cfg" --bindir)
 lib=$("$cfg" --libdir)
 mode=${2:-native}
 preload=pg_stat_statements,pg_index_steward
-if [[ $mode == timescale ]]; then preload=timescaledb,$preload; fi
+if [[ $mode != native ]]; then preload=timescaledb,$preload; fi
 tmp=$(mktemp -d /tmp/pgis-ha.XXXXXX)
 primary="$tmp/primary"
 standby="$tmp/standby"
@@ -54,6 +54,23 @@ INSERT INTO public.events SELECT '2026-01-01 UTC'::timestamptz+i*interval '30 se
   FROM generate_series(1,10000) i;
 SQL
 fi
+if [[ $mode == hypercore ]]; then
+    sql <<'SQL'
+CREATE EXTENSION timescaledb;
+CREATE TABLE public.telemetry(ts timestamptz NOT NULL, device int, reading int);
+SELECT create_hypertable('public.telemetry','ts',chunk_time_interval=>interval '1 day');
+ALTER TABLE public.telemetry SET (timescaledb.enable_columnstore=true,timescaledb.orderby='ts');
+INSERT INTO public.telemetry SELECT '2026-01-01 UTC'::timestamptz+i*interval '60 seconds',i%100,i
+  FROM generate_series(1,3000) i;
+SELECT compress_chunk(c) FROM show_chunks('public.telemetry') c;
+UPDATE index_steward.policy SET hypercore_changes=true;
+SELECT index_steward.queue_hypercore_sparse('public.telemetry','device','reading');
+SQL
+    cycle
+    sql -c "SELECT index_steward.queue_hypercore_rebuild('public.telemetry')"
+    cycle
+    check "$(sql -c "SELECT jsonb_array_length(detail->'completed_chunks') FROM index_steward.jobs WHERE detail->>'step'='rebuild'")" 1
+fi
 cycle --observe-only
 if [[ $mode == native ]]; then sql <<'SQL'
 INSERT INTO index_steward.jobs(action,target,signature,detail)
@@ -69,6 +86,21 @@ EOF
 old_socket=$PGHOST
 export PGHOST="$tmp/standby-sock"
 check "$(sql -c 'SELECT pg_is_in_recovery()')" t
+if [[ $mode == hypercore ]]; then
+    cycle
+    check "$(sql -c "SELECT state FROM index_steward.jobs WHERE detail->>'step'='rebuild'")" queued
+    "$bin/pg_ctl" -D "$primary" -m immediate -w stop >/dev/null
+    "$bin/pg_ctl" -D "$standby" -w promote >/dev/null
+    cycle
+    check "$(sql -c "SELECT jsonb_array_length(detail->'completed_chunks') FROM index_steward.jobs WHERE detail->>'step'='rebuild'")" 1
+    sql -c "UPDATE index_steward.policy SET primary_epoch_at=now()-interval '301 seconds'"
+    for _ in {1..3}; do cycle; done
+    check "$(sql -c "SELECT state||':'||jsonb_array_length(detail->'completed_chunks') FROM index_steward.jobs WHERE detail->>'step'='rebuild'")" done:3
+    check "$(sql -c 'SELECT count(*) FROM public.telemetry')" 3000
+    grep -q 'PG Index Steward .*"reason":"hypercore_rebuild_complete"' "$tmp/standby.log"
+    printf 'Resumed a columnstore maintenance job on the promoted standby\n'
+    exit 0
+fi
 if [[ $mode == timescale ]]; then
     export PGHOST="$old_socket"
     for _ in {1..100}; do
