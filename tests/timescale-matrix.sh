@@ -68,6 +68,14 @@ worker
 same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE id=3")" queued:timescale_rebuild
 worker
 same "$(sql -c "SELECT state||':'||(detail->'coverage'->>'indexed') FROM index_steward.jobs WHERE id=3")" done:4
+sql -c "UPDATE index_steward.policy SET min_free_bytes=9223372036854775807,retry_limit=1; SELECT index_steward.queue_timescale_index('public.matrix_events',ARRAY['reading','ts']::name[])"
+worker
+same "$(sql -c "SELECT reason FROM index_steward.jobs WHERE id=4")" disk_headroom
+same "$(sql -c "SELECT kind FROM index_steward.alerts() WHERE job_id=4")" retry_threshold
+sql -c "UPDATE index_steward.policy SET min_free_bytes=0"
+sleep 1.1
+worker
+same "$(sql -c "SELECT state||':'||(detail->'coverage'->>'indexed') FROM index_steward.jobs WHERE id=4")" done:4
 if [[ $version == 2.32.1 ]]; then
     sql -c "ALTER TABLE public.matrix_events SET (timescaledb.enable_columnstore=true,timescaledb.segmentby='device',timescaledb.orderby='ts');"
     sql -c "SELECT compress_chunk(chunk) FROM (SELECT show_chunks('public.matrix_events') AS chunk LIMIT 1) s"

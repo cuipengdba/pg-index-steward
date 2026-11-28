@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.10.0'
+VERSION = '3.11.0'
 
 
 class DatabaseError(RuntimeError):
@@ -694,6 +694,7 @@ def update_job(db, job, state, message, reason=None):
                    attempts=attempts+CASE WHEN {literal(state)}='running' THEN 1 ELSE 0 END,
                    retry_streak=retry_streak+CASE WHEN {literal(state)}='running' THEN 1 ELSE 0 END,
                    blocked_since=CASE WHEN {literal(state)} IN ('queued','running') THEN blocked_since END,
+                   blocker_checks=CASE WHEN {literal(state)} IN ('queued','running') THEN blocker_checks ELSE 0 END,
                    last_started_at=CASE WHEN {literal(state)}='running' THEN clock_timestamp() ELSE last_started_at END,
                    updated_at=clock_timestamp() WHERE id={job['id']} RETURNING id,attempts)
                    INSERT INTO {SCHEMA}.attempts(job_id,attempt)
@@ -708,6 +709,8 @@ def defer_job(db, job, reason, policy, attempted=False):
     delay = min(3600, base * (2 ** min(streak, 5)))
     rows = db.execute(f"""WITH deferred AS (UPDATE {SCHEMA}.jobs SET state='queued',
                    message={literal(reason)},reason={literal(reason)},
+                   blocker_checks=CASE WHEN reason={literal(reason)} THEN blocker_checks+1 ELSE 1 END,
+                   blocker_checked_at=clock_timestamp(),
                    blocked_since=coalesce(blocked_since,clock_timestamp()),updated_at=clock_timestamp(),
                    next_attempt_at=clock_timestamp()+make_interval(secs=>{delay}) WHERE id={job['id']}
                    RETURNING next_attempt_at::text AS retry_at) SELECT retry_at FROM deferred""")
@@ -717,8 +720,9 @@ def defer_job(db, job, reason, policy, attempted=False):
 def recheck_blockers(db, cfg, policy):
     jobs = db.rows(f"""SELECT * FROM {SCHEMA}.jobs WHERE state='queued'
         AND reason IN ('55P03','long_transaction','replication_lag','disk_headroom','53100')
-        AND next_attempt_at>clock_timestamp() AND updated_at<clock_timestamp()-interval '1 second'
-        ORDER BY updated_at,id LIMIT 20""")
+        AND next_attempt_at>clock_timestamp() AND NOT (detail @> '{{"advisory":true}}'::jsonb)
+        AND coalesce(blocker_checked_at,updated_at)<clock_timestamp()-interval '1 second'
+        ORDER BY coalesce(blocker_checked_at,updated_at),id LIMIT 50""")
     for job in jobs:
         reason, target = job['reason'], int(job['target'])
         if reason in ('long_transaction', 'replication_lag'):
@@ -745,10 +749,12 @@ def recheck_blockers(db, cfg, policy):
             ready = False
         if ready:
             db.execute(f"UPDATE {SCHEMA}.jobs SET next_attempt_at=clock_timestamp(),reason='blocker_cleared',"
-                       f"updated_at=clock_timestamp() WHERE id={job['id']} AND state='queued'")
+                       f"blocker_checks=0,blocker_checked_at=clock_timestamp(),updated_at=clock_timestamp() "
+                       f"WHERE id={job['id']} AND state='queued'")
             event(db, 'blocker_cleared', job, reason)
         else:
-            db.execute(f"UPDATE {SCHEMA}.jobs SET updated_at=clock_timestamp() WHERE id={job['id']} AND state='queued'")
+            db.execute(f"UPDATE {SCHEMA}.jobs SET blocker_checks=blocker_checks+1,blocker_checked_at=clock_timestamp() "
+                       f"WHERE id={job['id']} AND state='queued'")
 
 
 def reserve_next_window(db, job, cfg):
