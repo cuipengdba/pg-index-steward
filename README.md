@@ -88,6 +88,8 @@ PG14 与 TimescaleDB 2.8.0 的混合压缩超表可开启 `policy.timescale_lega
 
 自建超表索引使用根和块的扫描计数判断连续闲置，块集合变化会重新计时。`policy.timescale_retirement` 和 `pg_index_steward.auto_drop_managed` 共同控制清理。删除只适用于经过所有权登记的行存超表索引，且要求没有复制连接、复制槽或登记的副本。`protect_index` 可保护定期查询所用的根索引和块索引。清理使用普通 `DROP INDEX`，锁等待上限为 250 毫秒，单条语句上限为 3 秒。
 
+`pg-index-steward --queue --page-size 50` 显示任务状态、阻塞原因、下次重试时间与已覆盖块数。翻页时用 `--after-id` 传入上一页最后一个任务 ID。`policy.ddl_per_cycle` 默认为 1，可配置为 1–10，执行仍受每日配额和维护窗口限制。
+
 HypoPG 1.4.5 的源码随插件编译进 `pg_index_steward.so`。`index_steward.policy.use_hypopg` 默认开启。对部分普通表候选，在执行器连接内以生成的等值模板比较普通 `EXPLAIN` 计划。`detail.plan_evidence` 包含优化器成本与是否使用候选索引。该结果用于理解候选，真实业务效果以建成后的自然流量衡量。
 
 DBA 可在 `index_steward.plan_samples` 登记有代表性的单条 `SELECT` 和绑定值，分别比较通用计划与定制计划，并查看虚拟索引估算体积。仅登记受信任的查询与参数。`index_steward.index_portfolio` 展示候选覆盖的查询数、表写入量及覆盖索引和部分索引建议。`index_steward.relation_hotspots` 按表和查询形态归组规划、执行、I/O 统计和活动会话等待采样。使用外部延迟监控时，可向 `index_steward.latency_samples` 写入按 query ID 聚合的 P95 与样本量。

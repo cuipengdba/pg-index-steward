@@ -154,4 +154,25 @@ sql -c "DELETE FROM index_steward.retention_policy WHERE index_oid=$oid; UPDATE 
 worker
 same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE action='drop' AND target=$oid")" done:idle
 same "$(sql -c "SELECT count(*) FROM pg_index WHERE indexrelid=$oid")" 0
+
+sql <<'SQL'
+UPDATE index_steward.policy SET ddl_per_cycle=3,daily_limit=100;
+DO $fixture$ BEGIN
+  FOR i IN 1..12 LOOP
+    EXECUTE format('CREATE SCHEMA s%s',i);
+    EXECUTE format('CREATE TABLE s%s.sample(ts timestamptz NOT NULL, device int)',i);
+    PERFORM create_hypertable(format('s%s.sample',i)::regclass,'ts');
+    EXECUTE format('INSERT INTO s%s.sample VALUES (now(),1)',i);
+    PERFORM index_steward.queue_timescale_index(format('s%s.sample',i)::regclass,ARRAY['device']::name[]);
+  END LOOP;
+END $fixture$;
+UPDATE index_steward.jobs SET created_at=now()-interval '3 days' WHERE detail->>'schema'='s12';
+UPDATE index_steward.jobs SET detail=detail||'{"score":9999999}' WHERE detail->>'schema'='s11';
+SQL
+worker
+same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='sample' AND state='done'")" 3
+same "$(sql -c "SELECT state FROM index_steward.jobs WHERE detail->>'schema'='s12'")" done
+for _ in {1..3}; do worker; done
+same "$(sql -c "SELECT count(*) FROM index_steward.queue_status(0,500) WHERE table_name='sample' AND state='done' AND chunks=indexed_chunks")" 12
+worker --queue --page-size 2 | grep '"queue"' >/dev/null
 printf 'TimescaleDB chunk coverage and index adoption verified on %s\n' "$("$cfg" --version)"

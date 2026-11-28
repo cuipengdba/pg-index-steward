@@ -1600,7 +1600,10 @@ def run_cycle(db, cfg, allow_ddl):
                                 CASE WHEN created_at<clock_timestamp()-interval '2 days' THEN created_at END,
                                 (reason='window_capacity') DESC NULLS LAST,
                                 action='create' DESC, COALESCE((detail->>'score')::float8, 0) DESC,id LIMIT 50""")
+        completed_steps = 0
         for job in jobs:
+            if completed_steps >= min(policy['ddl_per_cycle'], policy['daily_limit'] - used['jobs']):
+                return
             cfg = settings(db)
             remaining = seconds_remaining(cfg['maintenance_window'], cfg['local_time'])
             if remaining < MIN_DDL_WINDOW_SECONDS:
@@ -1621,12 +1624,14 @@ def run_cycle(db, cfg, allow_ddl):
                 if not cfg['auto_create']:
                     defer_job(db, job, 'create_disabled', policy)
                 elif create_index(db, job, cfg, remaining, policy):
-                    return
+                    completed_steps += 1
             elif job['action'] == 'drop':
                 if drop_index(db, job, cfg, guards, remaining, policy):
-                    return
+                    completed_steps += 1
+                    if job['detail'].get('rollback'):
+                        return
             elif job['action'] == 'analyze' and analyze_table(db, job, policy):
-                return
+                completed_steps += 1
 
 
 def report(db, as_metrics=False, service=None, headers=True):
@@ -1667,8 +1672,13 @@ def main():
     output.add_argument('--status', action='store_true')
     output.add_argument('--metrics', action='store_true')
     output.add_argument('--alerts', action='store_true')
+    output.add_argument('--queue', action='store_true')
+    parser.add_argument('--after-id', type=int, default=0, help='Start the queue page after this job ID')
+    parser.add_argument('--page-size', type=int, default=50, help='Queue rows per database (1–500)')
     args = parser.parse_args()
-    if args.status or args.metrics or args.alerts:
+    if args.after_id < 0 or not 1 <= args.page_size <= 500:
+        parser.error('Invalid queue pagination')
+    if args.status or args.metrics or args.alerts or args.queue:
         if args.service and args.conninfo:
             parser.error('--service and --conninfo are mutually exclusive')
         aggregate = []
@@ -1678,10 +1688,17 @@ def main():
             db = None
             try:
                 db = Database(args.libpq, f'service={service} connect_timeout=5' if service else args.conninfo)
-                rows = (db.rows(f'SELECT * FROM {SCHEMA}.alerts() ORDER BY created_at LIMIT 500') if args.alerts
-                        else report(db, args.metrics, service, headers=position == 0))
+                key = 'status'
+                if args.alerts:
+                    key = 'alerts'
+                    rows = db.rows(f'SELECT * FROM {SCHEMA}.alerts() ORDER BY created_at LIMIT 500')
+                elif args.queue:
+                    key = 'queue'
+                    rows = db.rows(f'SELECT * FROM {SCHEMA}.queue_status({args.after_id},{args.page_size}) ORDER BY id')
+                else:
+                    rows = report(db, args.metrics, service, headers=position == 0)
                 if rows is not None:
-                    aggregate.append({'service': service, 'alerts' if args.alerts else 'status': rows})
+                    aggregate.append({'service': service, key: rows})
             except (DatabaseError, OSError) as exc:
                 print(f'Status query failed ({getattr(exc, "sqlstate", None) or type(exc).__name__})', file=sys.stderr)
                 return 1
@@ -1692,7 +1709,7 @@ def main():
             print(json.dumps(aggregate, indent=2, ensure_ascii=False))
         return 0
     if args.service:
-        parser.error('--service requires --status, --metrics, or --alerts')
+        parser.error('--service requires --status, --metrics, --alerts, or --queue')
     if not args.once and args.interval < 60:
         parser.error('--interval must be at least 60 seconds')
     while True:
