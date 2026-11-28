@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.18.0'
+VERSION = '3.19.0'
 
 
 class DatabaseError(RuntimeError):
@@ -1486,12 +1486,16 @@ def hypercore_rebuild(db, job, cfg, budget, policy):
     detail = job['detail']
     table = relation(detail['schema'], detail['table'])
     parent = int(job['target'])
-    layout = detail.get('step') == 'layout_rebuild'
+    rollback = detail.get('step') == 'layout_restore'
+    layout = detail.get('step') in ('layout_rebuild', 'layout_restore')
     desired = detail['after']
     mismatch = f"v.index IS DISTINCT FROM {json_value(desired['sparse_indexes'])}"
     if layout:
         mismatch += (f" OR v.segmentby IS DISTINCT FROM {literal(desired['segmentby'])}"
                      f" OR v.orderby IS DISTINCT FROM {literal(desired['orderby'])}")
+    scope = ''
+    if rollback:
+        scope = f" AND c.oid IN ({','.join(str(int(oid)) for oid in detail['rollback_chunks'])})"
     target = timescale_inventory(db, job)
     if not target or target['distributed'] or target['tablespace'] or target['external_tablespace']:
         update_job(db, job, 'cancelled', 'Hypertable layout changed', 'hypercore_identity')
@@ -1502,12 +1506,16 @@ def hypercore_rebuild(db, job, cfg, budget, policy):
         JOIN pg_class c ON c.oid=v.chunk JOIN pg_namespace n ON n.oid=c.relnamespace
         JOIN _timescaledb_catalog.compression_settings s ON s.relid=c.oid
         JOIN pg_inherits h ON h.inhrelid=c.oid AND h.inhparent={parent}
-        WHERE v.hypertable={parent} AND ({mismatch})
+        WHERE v.hypertable={parent} AND ({mismatch}){scope}
         ORDER BY c.oid LIMIT 1""")
     if not chunk:
         actual = db.one(f"SELECT {SCHEMA}.hypercore_settings({parent}::regclass) AS config")['config']
         if actual == detail['after']:
-            update_job(db, job, 'done', 'Columnstore chunk settings match the approved configuration', 'hypercore_rebuild_complete')
+            if rollback:
+                db.execute(f"UPDATE {SCHEMA}.verdicts SET state='rolled_back',updated_at=clock_timestamp() "
+                           f"WHERE job_id={int(detail['source_job'])}")
+            update_job(db, job, 'done', 'Columnstore chunk settings match the approved configuration',
+                       'hypercore_rollback_complete' if rollback else 'hypercore_rebuild_complete')
         else:
             update_job(db, job, 'cancelled', 'Hypertable configuration changed before completion', 'hypercore_identity')
         return False
@@ -1549,6 +1557,11 @@ def hypercore_rebuild(db, job, cfg, budget, policy):
             detail=jsonb_set(detail-ARRAY['active_chunk','active_chunk_bytes'],'{{completed_chunks}}',
                              (detail->'completed_chunks')||to_jsonb({chunk['oid']}::oid))
             WHERE id={job['id']}""")
+        if layout and not rollback and not detail.get('completed_chunks') and detail.get('baseline'):
+            db.execute(f"""INSERT INTO {SCHEMA}.verdicts(job_id,index_oid,index_fingerprint,baseline,indexed_at)
+                VALUES ({job['id']},{parent},'hypercore',{json_value(detail['baseline'])},clock_timestamp())
+                ON CONFLICT(job_id) DO NOTHING""")
+            db.execute(f"UPDATE {SCHEMA}.jobs SET reason='hypercore_observing',next_attempt_at='infinity' WHERE id={job['id']}")
         db.execute('COMMIT')
         event(db, 'step_completed', job, 'hypercore_chunk_complete')
     except DatabaseError as error:
@@ -1574,13 +1587,30 @@ def hypercore_configure(db, job, cfg, policy):
     budget = ddl_budget(db, policy, job)
     if not budget:
         return False
-    if detail.get('step') in ('rebuild', 'layout_rebuild'):
+    if detail.get('step') in ('rebuild', 'layout_rebuild', 'layout_restore'):
         return hypercore_rebuild(db, job, cfg, budget, policy)
     table = relation(detail['schema'], detail['table'])
-    layout = detail.get('step') == 'layout'
-    if layout:
+    rollback = detail.get('step') == 'layout_rollback'
+    layout = detail.get('step') in ('layout','layout_rollback')
+    baseline = []
+    if rollback:
+        restore = detail['restore']
+        options = (f"timescaledb.segmentby={ddl_value(restore['segmentby'] or '')},"
+                   f"timescaledb.orderby={ddl_value(restore['orderby'])}")
+    elif layout:
         options = (f"timescaledb.segmentby={ddl_value(identifier(detail['segmentby']))},"
                    f"timescaledb.orderby={ddl_value(identifier(detail['orderby']))}")
+        if policy['hypercore_validate_batches']:
+            baseline = db.rows(f"""SELECT userid,queryid,toplevel,calls,elapsed_ms AS elapsed,
+                shared_blocks AS hits,0 AS reads,extract(epoch FROM sampled_at)::float8 AS sampled_epoch,
+                (dimensions->>'period_seconds')::float8 AS period_seconds
+                FROM {SCHEMA}.query_diagnostics WHERE sampled_at>=now()-interval '24 hours' AND calls>=20
+                  AND (dimensions->'relation'->>'schema_name')={literal(detail['schema'])}
+                  AND (dimensions->'relation'->>'table_name')={literal(detail['table'])}
+                ORDER BY elapsed_ms DESC LIMIT 4""")
+            if not baseline:
+                defer_job(db, job, 'hypercore_waiting_baseline', policy)
+                return False
     else:
         sparse = f"bloom({identifier(detail['bloom'])}), minmax({identifier(detail['minmax'])})"
         options = f'timescaledb.compress_index={ddl_value(sparse)}'
@@ -1602,9 +1632,13 @@ def hypercore_configure(db, job, cfg, policy):
             return True
         db.execute(f"ALTER TABLE {table} SET ({options})")
         after = db.one(f"SELECT {SCHEMA}.hypercore_settings({job['target']}::regclass) AS config")['config']
+        if rollback and after != detail['restore']:
+            db.execute('ROLLBACK')
+            update_job(db, job, 'failed', 'Restored columnstore configuration did not match the saved configuration', 'hypercore_restore_review')
+            return True
         progress = {'after': after}
         if layout:
-            progress.update(step='layout_rebuild', completed_chunks=[])
+            progress.update(step='layout_restore' if rollback else 'layout_rebuild', completed_chunks=[], baseline=baseline)
         db.execute(f"UPDATE {SCHEMA}.jobs SET detail=detail||{json_value(progress)} WHERE id={job['id']}")
         if layout:
             db.execute(f"UPDATE {SCHEMA}.jobs SET state='queued',next_attempt_at='-infinity',reason='hypercore_layout_applied' WHERE id={job['id']}")
@@ -1829,6 +1863,16 @@ def measure(db, deltas, policy):
                        updated_at=clock_timestamp() WHERE job_id={row['job_id']}""")
         if state != 'observing':
             event(db, 'verdict', {'id': row['job_id'], 'action': 'create'}, state)
+        if row['index_fingerprint'] == 'hypercore':
+            if state in ('improved', 'mixed') and max(results) <= 1.05 and all(
+                    item['mean_blocks_after'] <= item['mean_blocks_before'] * 1.10 for item in comparison):
+                db.execute(f"UPDATE {SCHEMA}.jobs SET reason='hypercore_batch_accepted',next_attempt_at='-infinity' "
+                           f"WHERE id={row['job_id']} AND state='queued' AND reason='hypercore_observing'")
+            elif state != 'observing':
+                if state == 'mixed':
+                    db.execute(f"UPDATE {SCHEMA}.verdicts SET state='regression_review' WHERE job_id={row['job_id']}")
+                event(db, 'cycle_paused', {'id': row['job_id'], 'action': 'create'}, 'hypercore_batch_review')
+            continue
         if state == 'regression_review' and policy.get('auto_rollback') and all(strong_regression):
             indexes = index_inventory(db, row['index_oid'])
             if indexes and indexes[0]['managed'] and indexes[0]['scans'] >= 100:

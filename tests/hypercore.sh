@@ -104,4 +104,39 @@ same "$(sql -c "SELECT segmentby FROM timescaledb_information.chunk_columnstore_
 same "$(sql -c 'SELECT last(reading,ts) FROM public.telemetry')" "$latest_before"
 same "$(sql -c "$point")" "$point_before"
 same "$(sql -c "$range")" "$range_before"
+sql <<'SQL'
+INSERT INTO index_steward.query_diagnostics(userid,queryid,toplevel,sampled_at,elapsed_ms,planning_ms,calls,plans,shared_blocks,temp_blocks,category,dimensions)
+SELECT oid,42001,true,now(),50,0,50,0,50,0,'execution',
+       '{"relation":{"schema_name":"public","table_name":"telemetry"},"period_seconds":60}'
+FROM pg_roles WHERE rolname=current_user;
+UPDATE index_steward.policy SET hypercore_validate_batches=true;
+SELECT index_steward.queue_hypercore_layout('public.telemetry','device_group','reading');
+SQL
+worker
+worker
+same "$(sql -c "SELECT reason FROM index_steward.jobs WHERE id=4")" hypercore_observing
+python3 - "$root/bin/pg-index-steward" "$lib/libpq.so.5" <<'PY'
+import runpy
+import sys
+
+steward = runpy.run_path(sys.argv[1])
+db = steward['Database'](sys.argv[2], '')
+try:
+    row = db.one('SELECT baseline->0 AS sample,extract(epoch FROM indexed_at)::float8 AS cutoff FROM index_steward.verdicts WHERE job_id=4')
+    for minute in range(1, 4):
+        sample = {**row['sample'], 'sampled_epoch': row['cutoff'] + minute * 60 + 1,
+                  'elapsed': 150, 'hits': 150, 'wal_bytes': 0}
+        steward['measure'](db, [sample], {})
+finally:
+    db.close()
+PY
+same "$(sql -c 'SELECT state FROM index_steward.verdicts WHERE job_id=4')" regression_review
+sql -c 'SELECT index_steward.approve_hypercore_rollback(4)'
+worker
+worker
+worker
+same "$(sql -c 'SELECT state FROM index_steward.verdicts WHERE job_id=4')" rolled_back
+same "$(sql -c "SELECT orderby FROM timescaledb_information.chunk_columnstore_settings WHERE hypertable='public.telemetry'::regclass")" ts
+same "$(sql -c "$point")" "$point_before"
+same "$(sql -c "$range")" "$range_before"
 printf 'Verified columnstore baseline on %s\n' "$("$cfg" --version)"
