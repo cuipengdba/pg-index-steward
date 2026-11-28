@@ -5,6 +5,7 @@
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "parser/parser.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/json.h"
@@ -15,8 +16,16 @@ extern Datum hypopg_create_index(PG_FUNCTION_ARGS);
 extern Datum hypopg_reset(PG_FUNCTION_ARGS);
 static bool steward_hypo_initialized = false;
 
+PG_FUNCTION_INFO_V1(steward_lock_index);
+Datum
+steward_lock_index(PG_FUNCTION_ARGS)
+{
+	LockRelationOid(PG_GETARG_OID(0), AccessExclusiveLock);
+	PG_RETURN_VOID();
+}
+
 #if PG_VERSION_NUM >= 190000
-PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "2.2.0");
+PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "2.3.0");
 #else
 PG_MODULE_MAGIC;
 #endif

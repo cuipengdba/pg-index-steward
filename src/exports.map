@@ -2,6 +2,8 @@
   global:
     Pg_magic_func;
     _PG_init;
+    steward_lock_index;
+    pg_finfo_steward_lock_index;
     steward_candidates;
     pg_finfo_steward_candidates;
     steward_log_event;

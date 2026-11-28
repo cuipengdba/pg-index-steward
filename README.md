@@ -76,6 +76,8 @@ pg_index_steward.auto_drop_managed = on
 
 每实例用本机锁串行维护。每轮最多执行一项 DDL。普通表走并发创建和删除，默认候选范围为默认表空间中 1 MiB 至 5 GiB 的永久普通表。连接和排序类候选当前提供建议。单层原生分区表可用 `SELECT index_steward.queue_partition_index('public.events', ARRAY['device_id']::name[]);` 主动排队，并继续受窗口和自动创建开关控制。执行器创建父索引定义、并发创建各子索引并逐个挂接。PG14 与 TimescaleDB 2.8.0 组合可用 `SELECT index_steward.queue_timescale_index('public.events', ARRAY['device_id','recorded_at']::name[]);` 给本地未压缩超表排队。该路径逐块提交，正在建立索引的块可能短暂阻塞写入。
 
+超表索引任务保存每次构建使用的随机名称。中断后执行器核对索引定义及分块覆盖。有效且覆盖完整的索引直接验收。执行器只在维护窗口清理定义和身份仍匹配的自建无效索引，再从头构建。旧版本遗留的无效索引由 DBA 审核。
+
 HypoPG 1.4.5 的源码随插件编译进 `pg_index_steward.so`。`index_steward.policy.use_hypopg` 默认开启。对部分普通表候选，在执行器连接内以生成的等值模板比较普通 `EXPLAIN` 计划。`detail.plan_evidence` 包含优化器成本与是否使用候选索引。该结果用于理解候选，真实业务效果以建成后的自然流量衡量。
 
 DBA 可在 `index_steward.plan_samples` 登记有代表性的单条 `SELECT` 和绑定值，分别比较通用计划与定制计划，并查看虚拟索引估算体积。仅登记受信任的查询与参数。`index_steward.index_portfolio` 展示候选覆盖的查询数、表写入量及覆盖索引和部分索引建议。`index_steward.relation_hotspots` 按表和查询形态归组规划、执行、I/O 统计和活动会话等待采样。使用外部延迟监控时，可向 `index_steward.latency_samples` 写入按 query ID 聚合的 P95 与样本量。

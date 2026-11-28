@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 import time
@@ -899,6 +900,69 @@ def record_timescale_progress(db, job, coverage):
     db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{coverage}}',{json_value(coverage)}) WHERE id={job['id']}")
 
 
+def timescale_index_matches(db, job, index):
+    detail = job['detail']
+    keys = ','.join(literal(key) for key in detail['keys'])
+    return db.one(f"""SELECT EXISTS(SELECT FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+        JOIN pg_am am ON am.oid=c.relam
+        WHERE i.indexrelid={index['oid']} AND i.indrelid={job['target']} AND i.indislive
+          AND am.amname={literal(detail['method'])} AND i.indpred IS NULL AND i.indexprs IS NULL
+          AND NOT i.indisunique AND NOT i.indisreplident AND NOT i.indisclustered AND c.reloptions IS NULL
+          AND i.indnatts={len(detail['keys'])} AND i.indnkeyatts=i.indnatts
+          AND NOT EXISTS (SELECT FROM pg_constraint WHERE conindid=i.indexrelid)
+          AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(attnum,pos)
+                    JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+                    JOIN pg_opclass op ON op.oid=i.indclass[k.pos::int-1] AND op.opcdefault
+                    WHERE i.indcollation[k.pos::int-1]=a.attcollation AND i.indoption[k.pos::int-1]=0
+                    ORDER BY k.pos)=ARRAY[{keys}]::text[]) AS matches""")['matches']
+
+
+def timescale_reconcile(db, job, index, policy):
+    detail = job['detail']
+    if detail.get('build_intent') != detail['index'] or not timescale_index_matches(db, job, index):
+        update_job(db, job, 'failed', 'Inspect unverified hypertable index ownership', 'timescale_existing_index')
+        return False
+    coverage = timescale_coverage(db, job)
+    record_timescale_progress(db, job, coverage)
+    if index['valid'] and index['ready'] and coverage['chunks'] == coverage['indexed']:
+        update_job(db, job, 'done', 'Root index is valid and all chunks are covered', 'timescale_complete')
+        return False
+    if index['valid']:
+        update_job(db, job, 'failed', 'Inspect valid root with incomplete chunk coverage', 'timescale_coverage')
+        return False
+    budget = ddl_budget(db, policy, job)
+    if not budget:
+        return False
+    update_job(db, job, 'running', 'Removing invalid index before a full rebuild', 'timescale_cleanup')
+    try:
+        db.execute('BEGIN')
+        db.execute(f"SET LOCAL statement_timeout='{min(15, budget)}s'")
+        db.execute(f"LOCK TABLE ONLY {relation(detail['schema'], detail['table'])} IN SHARE UPDATE EXCLUSIVE MODE")
+        locked_target = db.one(f"SELECT to_regclass({literal(relation(detail['schema'], detail['table']))})::oid AS oid")
+        if locked_target['oid'] != job['target']:
+            db.execute('ROLLBACK')
+            update_job(db, job, 'cancelled', 'Hypertable identity changed before cleanup', 'timescale_identity')
+            return True
+        db.execute(f"SELECT {SCHEMA}.lock_index({index['oid']}::oid)")
+        locked = fetch_index(db, detail['schema'], detail['index'], job['target'])
+        if not locked or locked != index or not timescale_index_matches(db, job, locked):
+            db.execute('ROLLBACK')
+            update_job(db, job, 'failed', 'Index changed before cleanup', 'timescale_existing_index')
+            return True
+        db.execute(f"DROP INDEX {relation(detail['schema'], detail['index'])}")
+        db.execute(f"UPDATE {SCHEMA}.jobs SET state='queued',reason='timescale_rebuild',"
+                   f"next_attempt_at='-infinity',updated_at=clock_timestamp() WHERE id={job['id']}")
+        db.execute('COMMIT')
+        event(db, 'cleanup_completed', job, 'timescale_rebuild')
+    except DatabaseError as error:
+        db.execute('ROLLBACK')
+        if retryable(error):
+            defer_job(db, job, error.sqlstate, policy, attempted=True)
+        else:
+            update_job(db, job, 'failed', 'Hypertable index cleanup requires inspection', error.sqlstate)
+    return True
+
+
 def timescale_create(db, job, cfg, policy):
     detail = job['detail']
     if not policy['timescale_create']:
@@ -917,21 +981,23 @@ def timescale_create(db, job, cfg, policy):
     if target['distributed'] or target['compressed'] or target['tablespace'] or target['external_tablespace']:
         update_job(db, job, 'failed', 'Hypertable layout requires a tested execution strategy', 'timescale_layout')
         return False
+    existing = fetch_index(db, detail['schema'], detail['index'], target['oid'])
+    if existing:
+        return timescale_reconcile(db, job, existing, policy)
     if target['largest_chunk'] > policy['max_table_bytes']:
         defer_job(db, job, 'table_size_policy', policy)
         return False
     if shutil.disk_usage(cfg['data_directory']).free < max(policy['min_free_bytes'], 2 * target['bytes']):
         defer_job(db, job, 'disk_headroom', policy)
         return False
-    existing = fetch_index(db, detail['schema'], detail['index'], target['oid'])
-    if existing:
-        update_job(db, job, 'failed', 'Inspect existing root index and its chunk coverage', 'timescale_existing_index')
-        return False
     budget = ddl_budget(db, policy, job)
     if not budget:
         return False
     qualified = relation(detail['schema'], detail['table'])
     columns = ', '.join(identifier(key) for key in detail['keys'])
+    # A durable per-attempt name distinguishes interrupted work from pre-existing indexes.
+    detail['index'] = detail['build_intent'] = 'pgist_' + secrets.token_hex(16)
+    db.execute(f"UPDATE {SCHEMA}.jobs SET detail={json_value(detail)} WHERE id={job['id']}")
     update_job(db, job, 'running', 'Building hypertable index in chunk transactions', 'timescale_create')
     try:
         db.execute(f"SET statement_timeout='{budget}s'")
@@ -940,12 +1006,12 @@ def timescale_create(db, job, cfg, policy):
         index = fetch_index(db, detail['schema'], detail['index'], target['oid'])
         coverage = timescale_coverage(db, job)
         record_timescale_progress(db, job, coverage)
-        if not index or not index['valid'] or coverage['chunks'] != coverage['indexed']:
+        if not index or not index['valid'] or not index['ready'] or coverage['chunks'] != coverage['indexed']:
             update_job(db, job, 'failed', 'Hypertable index coverage requires repair', 'timescale_coverage')
         else:
             update_job(db, job, 'done', 'Root index is valid and all chunks are covered', 'timescale_complete')
     except DatabaseError as error:
-        if retryable(error) and not fetch_index(db, detail['schema'], detail['index'], target['oid']):
+        if retryable(error):
             defer_job(db, job, error.sqlstate, policy, attempted=True)
         else:
             update_job(db, job, 'failed', 'Hypertable build requires inspection', 'timescale_interrupted')
@@ -1198,6 +1264,9 @@ def emit_alerts(db):
 def recover_jobs(db, policy):
     for job in db.rows(f"SELECT * FROM {SCHEMA}.jobs WHERE state='running'"):
         detail = job['detail']
+        if detail.get('timescale'):
+            defer_job(db, job, 'timescale_worker_interrupted', policy)
+            continue
         if job['action'] == 'analyze':
             defer_job(db, job, 'interrupted_analyze', policy)
             continue
