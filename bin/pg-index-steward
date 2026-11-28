@@ -878,9 +878,10 @@ def timescale_inventory(db, job):
     detail = job['detail']
     return db.one(f"""SELECT c.oid, c.reltablespace::bigint AS tablespace,
         coalesce((to_jsonb(h)->>'is_distributed')::boolean,false) AS distributed,
-        EXISTS(SELECT FROM timescaledb_information.chunks ch
+        coalesce((to_jsonb(h)->>'compression_enabled')::boolean,false) AS compression_enabled,
+        (SELECT count(*) FROM timescaledb_information.chunks ch
           WHERE ch.hypertable_schema=h.hypertable_schema AND ch.hypertable_name=h.hypertable_name
-            AND ch.is_compressed) AS compressed,
+            AND ch.is_compressed) AS compressed_chunks,
         (SELECT count(*) FROM timescaledb_information.chunks ch
           WHERE ch.hypertable_schema=h.hypertable_schema AND ch.hypertable_name=h.hypertable_name) AS chunks,
         (SELECT coalesce(sum(pg_relation_size(k.oid)),0) FROM pg_inherits i JOIN pg_class k ON k.oid=i.inhrelid
@@ -921,7 +922,7 @@ def propose_timescale(db, deltas, policy):
             detail = dict(schema=schema, table=table, timescale=True, samples=[],
                           advisory=policy['timescale_discovery'] != 'execute', source='workload')
             target = timescale_inventory(db, {'detail': detail, 'target': obj['oid']})
-            if not target or target['distributed'] or target['compressed'] or target['external_tablespace'] or target['tablespace']:
+            if not target or target['distributed'] or target['compression_enabled'] or target['external_tablespace'] or target['tablespace']:
                 continue
             if target['bytes'] < MIN_TABLE_BYTES or query['reads'] + query['hits'] < 1000:
                 continue
@@ -1069,8 +1070,16 @@ def timescale_create(db, job, cfg, policy):
     if not target:
         update_job(db, job, 'cancelled', 'Hypertable identity changed', 'timescale_identity')
         return False
-    if target['distributed'] or target['compressed'] or target['tablespace'] or target['external_tablespace']:
+    if target['distributed'] or target['tablespace'] or target['external_tablespace']:
         update_job(db, job, 'failed', 'Hypertable layout requires a tested execution strategy', 'timescale_layout')
+        return False
+    storage = {'layout': 'legacy_compressed' if target['compressed_chunks'] else
+               'compression_enabled' if target['compression_enabled'] else 'rowstore',
+               'compressed_chunks': target['compressed_chunks'], 'total_chunks': target['chunks']}
+    detail['storage'] = storage
+    db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{storage}}',{json_value(storage)}) WHERE id={job['id']}")
+    if target['compression_enabled'] and (not policy['timescale_legacy_compression'] or detail.get('source') != 'manual'):
+        defer_job(db, job, 'timescale_compression_policy', policy)
         return False
     existing = fetch_index(db, detail['schema'], detail['index'], target['oid'])
     if existing:

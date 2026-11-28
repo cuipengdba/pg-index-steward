@@ -80,6 +80,10 @@ pg_index_steward.auto_drop_managed = on
 
 `policy.timescale_discovery` 默认为 `advice`，从现有查询统计和列统计生成候选。调用 `queue_timescale_index(regclass,name[])` 批准对应候选。三参数版本接受 `btree` 和单列 `brin`。设置 `execute` 后，满足策略的候选可自动执行。`off` 停止发现。范围列与物理顺序高度相关、块足够大且已有 B-tree 不覆盖该列时，执行器才会推荐 BRIN。
 
+`policy.timescale_build_mib_per_second` 用于按数据量估算初始构建时间。`detail.build_estimate` 和 `detail.build_elapsed_seconds` 可用于调整估算。超出窗口或配置上限时，任务记录 `timescale_budget_policy` 并保留重试资格。
+
+PG14 与 TimescaleDB 2.8.0 的混合压缩超表可开启 `policy.timescale_legacy_compression` 后显式排队。功能覆盖该组合的行存索引路径，压缩数据的查询仍由 TimescaleDB 的压缩执行路径处理。已验证范围为本地默认表空间的超表。Hypercore 列存、分布式超表和其他版本组合需要相应的兼容验证。
+
 HypoPG 1.4.5 的源码随插件编译进 `pg_index_steward.so`。`index_steward.policy.use_hypopg` 默认开启。对部分普通表候选，在执行器连接内以生成的等值模板比较普通 `EXPLAIN` 计划。`detail.plan_evidence` 包含优化器成本与是否使用候选索引。该结果用于理解候选，真实业务效果以建成后的自然流量衡量。
 
 DBA 可在 `index_steward.plan_samples` 登记有代表性的单条 `SELECT` 和绑定值，分别比较通用计划与定制计划，并查看虚拟索引估算体积。仅登记受信任的查询与参数。`index_steward.index_portfolio` 展示候选覆盖的查询数、表写入量及覆盖索引和部分索引建议。`index_steward.relation_hotspots` 按表和查询形态归组规划、执行、I/O 统计和活动会话等待采样。使用外部延迟监控时，可向 `index_steward.latency_samples` 写入按 query ID 聚合的 P95 与样本量。

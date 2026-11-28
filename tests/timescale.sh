@@ -122,4 +122,20 @@ same "$(sql -c "SELECT state FROM index_steward.jobs WHERE detail->'keys'='[\"re
 sql -c "UPDATE index_steward.policy SET ddl_timeout_seconds=1800; UPDATE index_steward.jobs SET next_attempt_at=now() WHERE reason='timescale_budget_policy';"
 worker
 same "$(sql -c "SELECT state FROM index_steward.jobs WHERE detail->>'table'='metrics' AND detail->'keys'='[\"payload\"]'")" done
+
+sql <<'SQL'
+CREATE TABLE public.compressed_metrics(ts timestamptz NOT NULL, device int, val int);
+SELECT create_hypertable('public.compressed_metrics','ts',chunk_time_interval=>interval '1 day');
+INSERT INTO public.compressed_metrics SELECT '2026-01-01 UTC'::timestamptz+i*interval '10 seconds', i%100, i
+  FROM generate_series(0,9999) i;
+ALTER TABLE public.compressed_metrics SET (timescaledb.compress,timescaledb.compress_segmentby='device');
+SELECT compress_chunk(chunk) FROM (SELECT show_chunks('public.compressed_metrics') AS chunk LIMIT 1) q;
+SELECT index_steward.queue_timescale_index('public.compressed_metrics',ARRAY['val']::name[]);
+SQL
+worker
+same "$(sql -c "SELECT reason||':'||(detail->'storage'->>'compressed_chunks') FROM index_steward.jobs WHERE detail->>'table'='compressed_metrics'")" timescale_compression_policy:1
+sql -c "UPDATE index_steward.policy SET timescale_legacy_compression=true; UPDATE index_steward.jobs SET next_attempt_at=now() WHERE reason='timescale_compression_policy';"
+worker
+same "$(sql -c "SELECT state||':'||(detail->'coverage'->>'indexed') FROM index_steward.jobs WHERE detail->>'table'='compressed_metrics'")" done:2
+same "$(sql -c "SELECT count(*) FROM public.compressed_metrics WHERE val IN (42,9000)")" 2
 printf 'TimescaleDB chunk coverage and index adoption verified on %s\n' "$("$cfg" --version)"
