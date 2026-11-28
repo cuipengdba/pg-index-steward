@@ -1,4 +1,8 @@
-# PG Index Steward 3.14.0
+# PG Index Steward 3.15.0
+
+- 经 DBA 排队和启用策略后，在维护窗口应用 Bloom 与 minmax 设置，并验证后续转换块使用新配置。
+
+## 3.14.0
 
 - 查询 Hypercore 布局与稀疏索引配置，隔离 CI 采集原 SQL 的列存执行计划与基线。
 

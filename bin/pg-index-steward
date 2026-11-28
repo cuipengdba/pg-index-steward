@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.14.0'
+VERSION = '3.15.0'
 
 
 class DatabaseError(RuntimeError):
@@ -799,6 +799,8 @@ def ddl_budget(db, policy, job):
         enabled = enabled and current and current.get('timescale_create' if job['action'] == 'create' else 'timescale_retirement')
         if job['detail'].get('source') == 'workload':
             enabled = enabled and current['timescale_discovery'] == 'execute'
+    if job['detail'].get('hypercore'):
+        enabled = enabled and current and current['hypercore_changes']
     if (not current or current['paused'] or seconds < MIN_DDL_WINDOW_SECONDS or
             not enabled or not allowed_by_policy(job, current) or not rollout_allows(job, current)):
         defer_job(db, job, 'window_or_policy_changed', policy)
@@ -1468,8 +1470,52 @@ def retire_timescale_index(db, job, guards, policy):
     return True
 
 
+def hypercore_configure(db, job, policy):
+    detail = job['detail']
+    pair = db.one(f"SELECT * FROM {SCHEMA}.timescale_pair_status()")
+    if not pair or pair['support'] != 'production' or pair['timescaledb_version'] != '2.32.1':
+        update_job(db, job, 'failed', 'Hypercore pair requires validation', 'hypercore_version')
+        return False
+    budget = ddl_budget(db, policy, job)
+    if not budget:
+        return False
+    table = relation(detail['schema'], detail['table'])
+    sparse = f"bloom({identifier(detail['bloom'])}), minmax({identifier(detail['minmax'])})"
+    update_job(db, job, 'running', 'Applying sparse index settings', 'hypercore_sparse')
+    try:
+        db.execute('BEGIN')
+        db.execute(f"SET LOCAL statement_timeout='{min(15, budget)}s'")
+        db.execute(f'LOCK TABLE ONLY {table} IN ACCESS EXCLUSIVE MODE')
+        actual = db.one(f"SELECT to_regclass({literal(table)})::oid AS oid")['oid']
+        before = db.one(f"SELECT {SCHEMA}.hypercore_settings({job['target']}::regclass) AS config")['config']
+        if actual != job['target'] or not before or before != detail['before']:
+            db.execute('ROLLBACK')
+            update_job(db, job, 'cancelled', 'Hypertable layout changed before applying settings', 'hypercore_identity')
+            return True
+        # Preserve existing explicit sparse definitions, including composite definitions.
+        if any(entry.get('source') == 'config' for entry in (before.get('sparse_indexes') or [])):
+            db.execute('ROLLBACK')
+            update_job(db, job, 'cancelled', 'Existing sparse definitions require manual review', 'hypercore_existing_sparse')
+            return True
+        value = "E'" + sparse.replace('\\', '\\\\').replace("'", "''") + "'"
+        db.execute(f"ALTER TABLE {table} SET (timescaledb.compress_index = {value})")
+        after = db.one(f"SELECT {SCHEMA}.hypercore_settings({job['target']}::regclass) AS config")['config']
+        db.execute(f"UPDATE {SCHEMA}.jobs SET detail=detail||jsonb_build_object('after',{json_value(after)}) WHERE id={job['id']}")
+        update_job(db, job, 'done', 'Sparse settings applied to future columnstore conversions', 'hypercore_sparse_applied')
+        db.execute('COMMIT')
+    except DatabaseError as error:
+        db.execute('ROLLBACK')
+        if retryable(error):
+            defer_job(db, job, error.sqlstate, policy, attempted=True)
+        else:
+            update_job(db, job, 'failed', 'Hypercore configuration requires review', error.sqlstate)
+    return True
+
+
 def create_index(db, job, cfg, remaining, policy):
     detail = job['detail']
+    if detail.get('hypercore'):
+        return hypercore_configure(db, job, policy)
     if detail.get('timescale'):
         return timescale_create(db, job, cfg, policy)
     if detail.get('partition'):
@@ -1717,6 +1763,9 @@ def emit_alerts(db):
 def recover_jobs(db, policy):
     for job in db.rows(f"SELECT * FROM {SCHEMA}.jobs WHERE state='running'"):
         detail = job['detail']
+        if detail.get('hypercore'):
+            defer_job(db, job, 'hypercore_worker_interrupted', policy)
+            continue
         if detail.get('timescale'):
             defer_job(db, job, 'timescale_worker_interrupted', policy)
             continue
@@ -1803,6 +1852,7 @@ def run_cycle(db, cfg, allow_ddl):
                        AND NOT COALESCE((detail->>'advisory')::boolean,false)
                        AND (action<>'create' OR COALESCE((detail->>'partition')::boolean,false)
                            OR COALESCE((detail->>'timescale')::boolean,false)
+                           OR COALESCE((detail->>'hypercore')::boolean,false)
                            OR evidence_at>clock_timestamp()-interval '7 days')
                        AND (action<>'create' OR {literal(cfg['auto_create'])})
                        AND (action<>'analyze' OR {literal(policy['auto_analyze'])})
