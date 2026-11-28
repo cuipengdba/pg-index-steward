@@ -37,7 +37,11 @@ UPDATE index_steward.policy SET min_free_bytes=0,ddl_per_cycle=2;
 SQL
 same "$(sql -c "SELECT extversion FROM pg_extension WHERE extname='timescaledb'")" "$version"
 if [[ $experimental == ON ]]; then
+    same "$(sql -c "SELECT support||':'||execution_enabled FROM index_steward.timescale_pair_status()")" experimental:false
     sql -c "UPDATE index_steward.policy SET timescale_experimental=true"
+    same "$(sql -c "SELECT support||':'||execution_enabled FROM index_steward.timescale_pair_status()")" experimental:true
+else
+    same "$(sql -c "SELECT support||':'||execution_enabled FROM index_steward.timescale_pair_status()")" production:true
 fi
 query="SELECT * FROM public.matrix_events WHERE device=42 AND ts>='2026-01-01' AND ts<'2026-01-02' ORDER BY ts"
 before=$(sql -c "$query")
