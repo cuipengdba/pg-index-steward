@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.7.0'
+VERSION = '3.8.0'
 
 
 class DatabaseError(RuntimeError):
@@ -1084,6 +1084,10 @@ def record_timescale_progress(db, job, coverage):
 def finish_timescale_build(db, job, index):
     marker = {key: index[key] for key in ('oid', 'fingerprint')}
     db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{owned_index}}',{json_value(marker)}) WHERE id={job['id']}")
+    if job['detail'].get('samples'):
+        db.execute(f"""INSERT INTO {SCHEMA}.verdicts(job_id,index_oid,index_fingerprint,baseline,indexed_at)
+            VALUES ({job['id']},{index['oid']},{literal(index['fingerprint'])},
+              {json_value(job['detail']['samples'])},clock_timestamp()) ON CONFLICT(job_id) DO NOTHING""")
     update_job(db, job, 'done', 'Root index is valid and all chunks are covered', 'timescale_complete')
 
 
@@ -1361,6 +1365,7 @@ def retire_timescale_index(db, job, guards, policy):
         return False
     update_job(db, job, 'running', 'Checking hypertable index for retirement', 'timescale_retirement')
     detail = job['detail']
+    rollback = detail.get('rollback', False)
     try:
         db.execute('BEGIN')
         db.execute(f"SET LOCAL statement_timeout='{min(budget, 3)}s'; SET LOCAL lock_timeout='250ms'")
@@ -1371,7 +1376,10 @@ def retire_timescale_index(db, job, guards, policy):
         usage = timescale_usage(db, build, index) if index else None
         evidence = db.one(f"""SELECT snapshot FROM {SCHEMA}.timescale_usage WHERE build_job={detail['build_job']}
              AND observed_at>now()-interval '5 minutes' AND idle_since<=now()-make_interval(days=>{policy['idle_days']})""")
-        if (not target or not usage or not evidence or usage['snapshot'] != evidence['snapshot'] or usage['protected'] or usage['dependent']
+        evidence_ok = ((evidence and usage and usage['snapshot'] == evidence['snapshot']) if not rollback else
+                       db.one(f"SELECT EXISTS(SELECT FROM {SCHEMA}.verdicts WHERE job_id={detail['build_job']} "
+                              "AND state='regression_review') AS ready")['ready'])
+        if (not target or not usage or not evidence_ok or usage['protected'] or usage['dependent']
                 or not index['valid'] or index['oid'] != job['target'] or index['fingerprint'] != job['signature']
                 or build['detail'].get('owned_index') != {'oid': index['oid'], 'fingerprint': index['fingerprint']}
                 or len(usage['snapshot']['objects']) != target['chunks'] + 1
@@ -1382,7 +1390,10 @@ def retire_timescale_index(db, job, guards, policy):
             return True
         db.execute(f"DROP INDEX {relation(detail['schema'],detail['name'])}")
         db.execute(f"UPDATE {SCHEMA}.jobs SET detail=detail||jsonb_build_object('retired_at',now()) WHERE id={build['id']}")
-        update_job(db, job, 'done', 'Retired an idle hypertable index', 'idle')
+        if rollback:
+            db.execute(f"UPDATE {SCHEMA}.verdicts SET state='rolled_back',updated_at=clock_timestamp() WHERE job_id={build['id']}")
+            db.execute(f"UPDATE {SCHEMA}.policy SET paused=true WHERE singleton")
+        update_job(db, job, 'done', 'Retired a hypertable index', 'rollback' if rollback else 'idle')
         db.execute('COMMIT')
     except DatabaseError as error:
         db.execute('ROLLBACK')
@@ -1437,11 +1448,11 @@ def create_index(db, job, cfg, remaining, policy):
                         INSERT INTO {SCHEMA}.managed_indexes(index_oid,table_oid,fingerprint,ddl,build_job)
                         VALUES ({idx['oid']},{tbl['oid']},{literal(idx['fingerprint'])},{literal(idx['ddl'])},{job['id']})
                         RETURNING index_oid)
-                        INSERT INTO {SCHEMA}.verdicts(job_id,index_oid,index_fingerprint,baseline)
-                        SELECT {job['id']}, index_oid,{literal(idx['fingerprint'])},{json_value(detail['samples'])} FROM managed
+                        INSERT INTO {SCHEMA}.verdicts(job_id,index_oid,index_fingerprint,baseline,indexed_at)
+                        SELECT {job['id']}, index_oid,{literal(idx['fingerprint'])},{json_value(detail['samples'])},clock_timestamp() FROM managed
                         ON CONFLICT (job_id) DO UPDATE SET index_oid=excluded.index_oid,
                             index_fingerprint=excluded.index_fingerprint,baseline=excluded.baseline,
-                            observations='[]',state='observing',updated_at=clock_timestamp()""")
+                            observations='[]',state='observing',indexed_at=excluded.indexed_at,updated_at=clock_timestamp()""")
         update_job(db, job, 'done', 'Index valid; observing natural traffic')
     except DatabaseError as exc:
         idx = fetch_index(db, detail['schema'], detail['index'], tbl['oid'])
@@ -1546,14 +1557,15 @@ def drop_index(db, job, cfg, guards, remaining, policy):
 
 def measure(db, deltas, policy):
     lookup = {(x['userid'], x['queryid'], x['toplevel']): x for x in deltas}
-    for row in db.rows(f"SELECT * FROM {SCHEMA}.verdicts WHERE state='observing' AND baseline<>'[]'::jsonb "
-                       "ORDER BY updated_at,job_id LIMIT 30"):
+    for row in db.rows(f"SELECT v.*,extract(epoch FROM indexed_at)::float8 AS indexed_epoch FROM {SCHEMA}.verdicts v "
+                       "WHERE state='observing' AND baseline<>'[]'::jsonb ORDER BY updated_at,job_id LIMIT 30"):
         baseline = row['baseline']
         history = row['observations']
+        cutoff = row['indexed_epoch'] or 0
         for item in baseline:
             k = item['userid'], item['queryid'], item['toplevel']
             sample = lookup.get(k)
-            if sample:
+            if sample and sample['sampled_epoch'] - sample['period_seconds'] >= cutoff:
                 history.append({name: sample[name] for name in ('userid','queryid','toplevel','calls','elapsed','reads','hits','wal_bytes',
                                                                  'sampled_epoch','period_seconds')})
         results = []
@@ -1561,6 +1573,7 @@ def measure(db, deltas, policy):
         comparison = []
         for item in baseline:
             selected = [x for x in history if all(x[key] == item[key] for key in ('userid','queryid','toplevel'))]
+            selected = [x for x in selected if x['calls'] > 0 and x.get('sampled_epoch', 0) - x.get('period_seconds', 0) >= cutoff]
             if item.get('period_seconds', 0) > 0:
                 rate = item['calls'] / item['period_seconds']
                 selected = [x for x in selected if x.get('period_seconds', 0) > 0 and
@@ -1575,7 +1588,8 @@ def measure(db, deltas, policy):
                 results.append(ratio)
                 blocks_old = (item['hits'] + item['reads']) / item['calls']
                 blocks_new = sum(x['hits'] + x['reads'] for x in selected) / calls
-                strong_regression.append(ratio >= 2 and blocks_old > 0 and blocks_new >= blocks_old * 1.5)
+                persistent = sum(x['elapsed'] / x['calls'] >= original * 1.5 for x in selected) >= 3
+                strong_regression.append(persistent and ratio >= 2 and blocks_old > 0 and blocks_new >= blocks_old * 1.5)
                 result = {'queryid': item['queryid'], 'mean_ratio': ratio, 'calls': calls,
                           'mean_blocks_before': blocks_old, 'mean_blocks_after': blocks_new,
                           'wal_bytes_per_call_before': item.get('wal_bytes', 0) / item['calls'],
@@ -1588,7 +1602,7 @@ def measure(db, deltas, policy):
                         if metric:
                             result[f'{name}_p95_ms'] = metric['p95_ms']
                 comparison.append(result)
-        state = 'observing'
+        state = 'insufficient_data' if cutoff and time.time() - cutoff > 30 * 86400 else 'observing'
         if results and len(results) == len(baseline):
             state = 'regression_review' if max(results) > 1.20 else ('improved' if max(results) <= 0.80 else 'mixed')
         db.execute(f"""UPDATE {SCHEMA}.verdicts SET observations={json_value(history[-300:])},

@@ -115,6 +115,7 @@ same "$(sql -c "SELECT detail->>'workload_queries' FROM index_steward.jobs WHERE
 sql -c "SELECT index_steward.queue_timescale_index('public.metrics',ARRAY['device','ts']::name[]);"
 worker
 same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='metrics' AND state='done' AND detail->>'method'='btree'")" 1
+same "$(sql -c "SELECT count(*) FROM index_steward.verdicts v JOIN index_steward.jobs j ON j.id=v.job_id WHERE j.detail->>'table'='metrics' AND jsonb_array_length(v.baseline)=1 AND v.indexed_at IS NOT NULL")" 1
 sql -c "SELECT index_steward.queue_timescale_index('public.metrics',ARRAY['ts']::name[],'brin');"
 worker
 same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='metrics' AND state='done' AND detail->>'method'='brin' AND detail->'coverage'->>'indexed'='1'")" 1
@@ -186,4 +187,8 @@ same "$(sql -c "SELECT state FROM index_steward.jobs WHERE detail->>'schema'='s1
 for _ in {1..3}; do worker; done
 same "$(sql -c "SELECT count(*) FROM index_steward.queue_status(0,500) WHERE table_name='sample' AND state='done' AND chunks=indexed_chunks")" 12
 worker --queue --page-size 2 | grep '"queue"' >/dev/null
+sql -c "UPDATE index_steward.verdicts SET state='regression_review' WHERE job_id IN (SELECT id FROM index_steward.jobs WHERE detail->>'table'='metrics'); SELECT index_steward.approve_rollback(job_id) FROM index_steward.verdicts WHERE state='regression_review'"
+worker
+same "$(sql -c "SELECT state FROM index_steward.verdicts WHERE job_id IN (SELECT id FROM index_steward.jobs WHERE detail->>'table'='metrics')")" rolled_back
+same "$(sql -c 'SELECT paused FROM index_steward.policy')" t
 printf 'TimescaleDB chunk coverage and index adoption verified on %s\n' "$("$cfg" --version)"

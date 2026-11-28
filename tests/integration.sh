@@ -110,8 +110,13 @@ steward = runpy.run_path(sys.argv[1])
 db = steward['Database'](sys.argv[2], '')
 try:
     original = db.one('SELECT baseline->0 AS sample FROM index_steward.verdicts')['sample']
-    for _ in range(3):
-        steward['measure'](db, [{**original, 'calls': 50, 'elapsed': original['elapsed'] / 10}], {})
+    cutoff = db.one('SELECT extract(epoch FROM indexed_at) AS cutoff FROM index_steward.verdicts')['cutoff']
+    steward['measure'](db, [{**original, 'sampled_epoch': cutoff, 'period_seconds': 60}], {})
+    assert db.one('SELECT observations FROM index_steward.verdicts')['observations'] == []
+    for step in range(1, 4):
+        period = original['period_seconds'] * 2.5
+        steward['measure'](db, [{**original, 'calls': 50, 'elapsed': original['elapsed'] / 10,
+                                 'sampled_epoch': cutoff + step * period + 1, 'period_seconds': period}], {})
     verdict = db.one('SELECT state, comparison FROM index_steward.verdicts')
     assert verdict['state'] == 'improved' and verdict['comparison'][0]['calls'] == 150, verdict
 finally:
