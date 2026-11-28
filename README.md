@@ -13,8 +13,8 @@ PG Index Steward 根据 `pg_stat_statements` 的自然流量统计生成索引�
 从 [GitHub Releases](https://github.com/cuipengdba/pg-index-steward/releases) 下载本机架构的 `.tar.gz`。两个架构包各自包含 PG14、15、16、17、18、19 对应的动态库。Linux 预编译包面向 glibc 环境。自定义 PostgreSQL 二进制 ABI、不同 C 库或系统装载失败时，使用目标实例的 `pg_config` 源码编译。PG14 上游维护已结束。
 
 ```bash
-tar -xzf pg-index-steward-3.0.0-linux-x86_64.tar.gz
-cd pg-index-steward-3.0.0-linux-x86_64
+tar -xzf pg-index-steward-3.10.0-linux-x86_64.tar.gz
+cd pg-index-steward-3.10.0-linux-x86_64
 sudo ./install.sh \
   --pg-config /opt/pgsql/bin/pg_config \
   --data-dir /srv/pgsql/data \
@@ -31,7 +31,7 @@ CREATE EXTENSION IF NOT EXISTS pg_index_steward;
 SELECT * FROM index_steward.settings();
 ```
 
-升级已有实例时，先停止执行器并备份数据库和原安装包，再用新安装包的 `--files-only` 更新文件。安排重启 PostgreSQL 加载新动态库，在各目标数据库执行 `ALTER EXTENSION pg_index_steward UPDATE TO '3.0.0';`，核对配置与 `SELECT * FROM index_steward.status();` 后恢复执行器。执行器版本通过 `pg-index-steward --version` 查看，须与目标数据库中的扩展版本一致。升级 SQL 从 0.1.0 起逐级保留现有策略和队列。回退整个扩展版本时，使用升级前备份恢复扩展的数据库对象和原安装包。
+升级已有实例时，先停止执行器并备份数据库和原安装包，再用新安装包的 `--files-only` 更新文件。安排重启 PostgreSQL 加载新动态库，在各目标数据库执行 `ALTER EXTENSION pg_index_steward UPDATE TO '3.10.0';`，核对配置与 `SELECT * FROM index_steward.status();` 后恢复执行器。执行器版本通过 `pg-index-steward --version` 查看，须与目标数据库中的扩展版本一致。升级 SQL 从 0.1.0 起逐级保留现有策略和队列。回退整个扩展版本时，使用升级前备份恢复扩展的数据库对象和原安装包。
 
 未使用 systemd 时，可以由已有任务管理器执行以下命令，或去掉 `--once` 作为常驻进程。使用 libpq 原有的本机连接参数或认证文件指定目标。
 
@@ -74,7 +74,7 @@ pg_index_steward.auto_drop_managed = on
 
 任务进入持久化队列并等待维护窗口。执行前重新检查对象、索引重叠、磁盘余量、长事务、复制状态和窗口余额。受阻任务保留 `next_attempt_at`，调度器继续处理下一条符合条件的任务。等待两天的任务优先，锁冲突、超时等可重试错误按退避时间重排。`policy.retry_limit` 是连续尝试告警阈值，达到阈值的临时阻塞任务继续重试，同一任务的同类告警最多每 24 小时写入一次 PostgreSQL 日志。升级前已达到旧上限的任务可在核对后用 `index_steward.retry_job(id)` 重新激活。超过七天没有新证据的普通表建索引候选等待下一次负载采样更新。闲置删除后同一候选有七天重新创建冷却期，回退后有三十天冷却期。
 
-每实例用本机锁串行维护，每轮默认执行一项 DDL。普通表走并发创建和删除，默认候选范围为默认表空间中 1 MiB 至 5 GiB 的永久普通表。连接和排序类候选当前提供建议。单层原生分区表可用 `SELECT index_steward.queue_partition_index('public.events', ARRAY['device_id']::name[]);` 主动排队，并继续受窗口和自动创建开关控制。执行器创建父索引定义、并发创建各子索引并逐个挂接。PG14 与 TimescaleDB 2.8.0 组合可用 `SELECT index_steward.queue_timescale_index('public.events', ARRAY['device_id','recorded_at']::name[]);` 给本地未压缩超表排队。该路径逐块提交，正在建立索引的块可能短暂阻塞写入。
+每实例用本机锁串行维护，每轮默认执行一项 DDL。普通表走并发创建和删除，默认候选范围为默认表空间中 1 MiB 至 5 GiB 的永久普通表。连接和排序类候选当前提供建议。原生分区表可用 `SELECT index_steward.queue_partition_index('public.events', ARRAY['device_id']::name[]);` 主动排队。执行器创建父索引定义，并发创建叶子分区索引并逐级挂接。对下表支持的本地未压缩超表，可用 `SELECT index_steward.queue_timescale_index('public.events', ARRAY['device_id','recorded_at']::name[]);` 排队。TimescaleDB 逐块提交，正在建立索引的块可能阻塞写入。
 
 超表索引任务保存每次构建使用的随机名称。中断后执行器核对索引定义及分块覆盖。有效且覆盖完整的索引直接验收。执行器只在维护窗口清理定义和身份仍匹配的自建无效索引，再从头构建。旧版本遗留的无效索引由 DBA 审核。
 
@@ -93,9 +93,11 @@ pg_index_steward.auto_drop_managed = on
 
 PG14 与 TimescaleDB 2.8.0 的混合压缩超表可开启 `policy.timescale_legacy_compression` 后显式排队。该组合的索引覆盖行存路径，压缩数据的查询由 TimescaleDB 的压缩执行路径处理。新版按索引定义核对覆盖。中断后若所有等价块索引的归属均能确认，执行器在维护窗口清理无效根索引并安排重建。归属不明确时进入人工审查。
 
+`SELECT * FROM index_steward.timescale_storage('public.events');` 展示行存、压缩或列存状态，并在 TimescaleDB 提供相关视图时展示分段和排序设置。Hypercore 列存支持诊断，建索引测试覆盖本地行存超表。
+
 主备切换后，执行器在 `failover_grace_seconds` 到期后重新核对超表索引。任务记录和索引需要已回放到新主库。隔离测试先停止旧主库，再提升物理备库并验证待恢复索引的全量覆盖。生产的旧主库隔离由高可用系统处理。
 
-自建超表索引使用根和块的扫描计数判断连续闲置，块集合变化会重新计时。`policy.timescale_retirement` 和 `pg_index_steward.auto_drop_managed` 共同控制清理。删除只适用于经过所有权登记的行存超表索引，且要求没有复制连接、复制槽或登记的副本。`protect_index` 可保护定期查询所用的根索引和块索引。清理使用普通 `DROP INDEX`，锁等待上限为 250 毫秒，单条语句上限为 3 秒。
+自建超表索引使用根和块的扫描计数判断连续闲置，块集合变化会重新计时。`policy.timescale_retirement` 和 `pg_index_steward.auto_drop_managed` 共同控制清理。带副本的实例可显式开启 `policy.timescale_replica_retirement`，仅支持已登记且证据完整的直连物理副本。`protect_index` 可保护定期查询所用的根索引和块索引。清理使用普通 `DROP INDEX`，锁等待上限为 250 毫秒，单条语句上限为 3 秒。
 
 `pg-index-steward --queue --page-size 50` 显示任务状态、阻塞原因、下次重试时间与已覆盖块数。翻页时用 `--after-id` 传入上一页最后一个任务 ID。`policy.ddl_per_cycle` 默认为 1，可配置为 1–10，执行仍受每日配额和维护窗口限制。
 
@@ -126,7 +128,10 @@ FROM index_steward.jobs WHERE action = 'drop' ORDER BY id DESC;
 pg-index-steward --status --service primary_a --service primary_b
 pg-index-steward --metrics --service primary_a --service primary_b
 pg-index-steward --alerts --service primary_a --service primary_b
+pg-index-steward --report --days 30 --service primary_a --service primary_b
 ```
+
+`maintenance_report(integer)` 按任务入队时间汇总完成率、阻塞时长和收益验收状态。监控账号需要 `USAGE ON SCHEMA index_steward` 和该函数的执行权限。
 
 `index_steward.set_paused(true)` 暂停新的数据库变更。`policy.rollout_percent` 控制纳入执行范围的表比例。可用 `index_steward.protect_index('schema.index_name', '2099-12-31')` 为周期任务保留索引。主备切换沿用业务既有的旧主隔离流程，执行器在发现新 WAL 时间线后按 `policy.failover_grace_seconds` 等待，并重新建立闲置观察基线。
 
@@ -142,7 +147,7 @@ pg-index-steward --alerts --service primary_a --service primary_b
 
 ```bash
 sha256sum -c SHA256SUMS --ignore-missing
-gh attestation verify pg-index-steward-3.0.0-linux-x86_64.tar.gz \
+gh attestation verify pg-index-steward-3.10.0-linux-x86_64.tar.gz \
   --repo cuipengdba/pg-index-steward --bundle provenance.jsonl \
   --custom-trusted-root trusted_root.jsonl
 ```

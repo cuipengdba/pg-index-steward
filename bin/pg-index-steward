@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.9.0'
+VERSION = '3.10.0'
 
 
 class DatabaseError(RuntimeError):
@@ -1874,12 +1874,16 @@ def main():
     output.add_argument('--metrics', action='store_true')
     output.add_argument('--alerts', action='store_true')
     output.add_argument('--queue', action='store_true')
+    output.add_argument('--report', action='store_true')
+    parser.add_argument('--days', type=int, default=30, help='Lookback for the maintenance report (1–365)')
     parser.add_argument('--after-id', type=int, default=0, help='Start the queue page after this job ID')
     parser.add_argument('--page-size', type=int, default=50, help='Queue rows per database (1–500)')
     args = parser.parse_args()
     if args.after_id < 0 or not 1 <= args.page_size <= 500:
         parser.error('Invalid queue pagination')
-    if args.status or args.metrics or args.alerts or args.queue:
+    if not 1 <= args.days <= 365:
+        parser.error('--days must be between 1 and 365')
+    if args.status or args.metrics or args.alerts or args.queue or args.report:
         if args.service and args.conninfo:
             parser.error('--service and --conninfo are mutually exclusive')
         aggregate = []
@@ -1896,6 +1900,9 @@ def main():
                 elif args.queue:
                     key = 'queue'
                     rows = db.rows(f'SELECT * FROM {SCHEMA}.queue_status({args.after_id},{args.page_size}) ORDER BY id')
+                elif args.report:
+                    key = 'report'
+                    rows = json.loads(db.execute(f'SELECT {SCHEMA}.maintenance_report({args.days})')[0])
                 else:
                     rows = report(db, args.metrics, service, headers=position == 0)
                 if rows is not None:
@@ -1910,7 +1917,7 @@ def main():
             print(json.dumps(aggregate, indent=2, ensure_ascii=False))
         return 0
     if args.service:
-        parser.error('--service requires --status, --metrics, --alerts, or --queue')
+        parser.error('--service requires --status, --metrics, --alerts, --queue, or --report')
     if not args.once and args.interval < 60:
         parser.error('--interval must be at least 60 seconds')
     while True:
