@@ -50,8 +50,32 @@ jobs:
           path: payload/${{ matrix.platform.arch }}/pg${{ matrix.pg }}/pg_index_steward.so
           if-no-files-found: error
 
+  timescale:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache isolated TimescaleDB fixture
+        id: fixture
+        uses: actions/cache@v4
+        with:
+          path: /tmp/pgis-timescale-pg14.19
+          key: timescale-2.8.0-pg14.19-${{ matrix.runner }}-${{ hashFiles('scripts/build-timescale-fixture.sh') }}
+      - name: Build isolated TimescaleDB fixture
+        if: steps.fixture.outputs.cache-hit != 'true'
+        run: bash scripts/build-timescale-fixture.sh /tmp/pgis-timescale-pg14.19
+      - name: Verify real hypertable index creation
+        run: |
+          set -euo pipefail
+          pgconfig=/tmp/pgis-timescale-pg14.19/bin/pg_config
+          make PG_CONFIG="$pgconfig" install
+          bash tests/timescale.sh "$pgconfig"
+
   package:
-    needs: verify
+    needs: [verify, timescale]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:

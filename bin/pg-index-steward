@@ -725,6 +725,8 @@ def ddl_budget(db, policy, job):
     enabled = cfg['auto_create'] if job['action'] == 'create' else drop_enabled
     if job['action'] == 'analyze':
         enabled = current and current.get('auto_analyze')
+    if job['detail'].get('timescale'):
+        enabled = enabled and current and current.get('timescale_create')
     if (not current or current['paused'] or seconds < MIN_DDL_WINDOW_SECONDS or
             not enabled or not allowed_by_policy(job, current) or not rollout_allows(job, current)):
         defer_job(db, job, 'window_or_policy_changed', policy)
@@ -861,8 +863,104 @@ def partition_step(db, job, cfg, remaining, policy):
     return True
 
 
+def timescale_inventory(db, job):
+    detail = job['detail']
+    return db.one(f"""SELECT c.oid, c.reltablespace::bigint AS tablespace,
+        coalesce((to_jsonb(h)->>'is_distributed')::boolean,false) AS distributed,
+        EXISTS(SELECT FROM timescaledb_information.chunks ch
+          WHERE ch.hypertable_schema=h.hypertable_schema AND ch.hypertable_name=h.hypertable_name
+            AND ch.is_compressed) AS compressed,
+        (SELECT count(*) FROM timescaledb_information.chunks ch
+          WHERE ch.hypertable_schema=h.hypertable_schema AND ch.hypertable_name=h.hypertable_name) AS chunks,
+        (SELECT coalesce(sum(pg_relation_size(k.oid)),0) FROM pg_inherits i JOIN pg_class k ON k.oid=i.inhrelid
+          WHERE i.inhparent=c.oid) AS bytes,
+        (SELECT coalesce(max(pg_relation_size(k.oid)),0) FROM pg_inherits i JOIN pg_class k ON k.oid=i.inhrelid
+          WHERE i.inhparent=c.oid) AS largest_chunk,
+        EXISTS(SELECT FROM pg_inherits i JOIN pg_class k ON k.oid=i.inhrelid
+          WHERE i.inhparent=c.oid AND k.reltablespace<>0) AS external_tablespace
+        FROM timescaledb_information.hypertables h JOIN pg_namespace n ON n.nspname=h.hypertable_schema
+        JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=h.hypertable_name
+        WHERE c.oid={int(job['target'])} AND c.relkind='r' AND NOT c.relrowsecurity
+        AND h.hypertable_schema={literal(detail['schema'])} AND h.hypertable_name={literal(detail['table'])}""")
+
+
+def timescale_coverage(db, job):
+    detail = job['detail']
+    return db.one(f"""SELECT count(*) AS chunks,count(*) FILTER (WHERE EXISTS (
+        SELECT FROM _timescaledb_catalog.chunk ch
+        JOIN _timescaledb_catalog.chunk_index m ON m.chunk_id=ch.id AND m.hypertable_id=ch.hypertable_id
+        JOIN pg_class ci ON ci.relname=m.index_name
+        JOIN pg_index ix ON ix.indexrelid=ci.oid AND ix.indrelid=child.oid AND ix.indisvalid AND ix.indisready
+        JOIN pg_am am ON am.oid=ci.relam
+        WHERE ch.schema_name=ns.nspname AND ch.table_name=child.relname AND NOT ch.dropped
+          AND m.hypertable_index_name={literal(detail['index'])} AND am.amname={literal(detail['method'])}
+    )) AS indexed FROM pg_inherits inh JOIN pg_class child ON child.oid=inh.inhrelid
+    JOIN pg_namespace ns ON ns.oid=child.relnamespace WHERE inh.inhparent={int(job['target'])}""")
+
+
+def record_timescale_progress(db, job, coverage):
+    db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{coverage}}',{json_value(coverage)}) WHERE id={job['id']}")
+
+
+def timescale_create(db, job, cfg, policy):
+    detail = job['detail']
+    if not policy['timescale_create']:
+        defer_job(db, job, 'timescale_disabled', policy)
+        return False
+    supported = db.one(f"""SELECT EXISTS(SELECT FROM pg_extension e JOIN {SCHEMA}.timescale_compatibility m
+        ON m.extension_version=e.extversion AND m.pg_major=current_setting('server_version_num')::int/10000
+        WHERE e.extname='timescaledb') AS supported""")['supported']
+    if not supported:
+        update_job(db, job, 'failed', 'TimescaleDB and PostgreSQL version pair requires validation', 'timescale_version')
+        return False
+    target = timescale_inventory(db, job)
+    if not target:
+        update_job(db, job, 'cancelled', 'Hypertable identity changed', 'timescale_identity')
+        return False
+    if target['distributed'] or target['compressed'] or target['tablespace'] or target['external_tablespace']:
+        update_job(db, job, 'failed', 'Hypertable layout requires a tested execution strategy', 'timescale_layout')
+        return False
+    if target['largest_chunk'] > policy['max_table_bytes']:
+        defer_job(db, job, 'table_size_policy', policy)
+        return False
+    if shutil.disk_usage(cfg['data_directory']).free < max(policy['min_free_bytes'], 2 * target['bytes']):
+        defer_job(db, job, 'disk_headroom', policy)
+        return False
+    existing = fetch_index(db, detail['schema'], detail['index'], target['oid'])
+    if existing:
+        update_job(db, job, 'failed', 'Inspect existing root index and its chunk coverage', 'timescale_existing_index')
+        return False
+    budget = ddl_budget(db, policy, job)
+    if not budget:
+        return False
+    qualified = relation(detail['schema'], detail['table'])
+    columns = ', '.join(identifier(key) for key in detail['keys'])
+    update_job(db, job, 'running', 'Building hypertable index in chunk transactions', 'timescale_create')
+    try:
+        db.execute(f"SET statement_timeout='{budget}s'")
+        db.execute(f"CREATE INDEX {identifier(detail['index'])} ON {qualified} USING btree ({columns}) "
+                   "WITH (timescaledb.transaction_per_chunk)")
+        index = fetch_index(db, detail['schema'], detail['index'], target['oid'])
+        coverage = timescale_coverage(db, job)
+        record_timescale_progress(db, job, coverage)
+        if not index or not index['valid'] or coverage['chunks'] != coverage['indexed']:
+            update_job(db, job, 'failed', 'Hypertable index coverage requires repair', 'timescale_coverage')
+        else:
+            update_job(db, job, 'done', 'Root index is valid and all chunks are covered', 'timescale_complete')
+    except DatabaseError as error:
+        if retryable(error) and not fetch_index(db, detail['schema'], detail['index'], target['oid']):
+            defer_job(db, job, error.sqlstate, policy, attempted=True)
+        else:
+            update_job(db, job, 'failed', 'Hypertable build requires inspection', 'timescale_interrupted')
+    finally:
+        db.execute("SET statement_timeout='15s'")
+    return True
+
+
 def create_index(db, job, cfg, remaining, policy):
     detail = job['detail']
+    if detail.get('timescale'):
+        return timescale_create(db, job, cfg, policy)
     if detail.get('partition'):
         return partition_step(db, job, cfg, remaining, policy)
     tbl = eligible_table(db, detail['schema'], detail['table'])
@@ -1177,6 +1275,7 @@ def run_cycle(db, cfg, allow_ddl):
                        AND next_attempt_at<=clock_timestamp()
                        AND NOT COALESCE((detail->>'advisory')::boolean,false)
                        AND (action<>'create' OR COALESCE((detail->>'partition')::boolean,false)
+                           OR COALESCE((detail->>'timescale')::boolean,false)
                            OR evidence_at>clock_timestamp()-interval '7 days')
                        AND (action<>'create' OR {literal(cfg['auto_create'])})
                        AND (action<>'analyze' OR {literal(policy['auto_analyze'])})
