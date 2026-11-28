@@ -68,4 +68,10 @@ worker
 same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE id=3")" queued:timescale_rebuild
 worker
 same "$(sql -c "SELECT state||':'||(detail->'coverage'->>'indexed') FROM index_steward.jobs WHERE id=3")" done:4
+if [[ $version == 2.32.1 ]]; then
+    sql -c "ALTER TABLE public.matrix_events SET (timescaledb.enable_columnstore=true,timescaledb.segmentby='device',timescaledb.orderby='ts');"
+    sql -c "SELECT compress_chunk(chunk) FROM (SELECT show_chunks('public.matrix_events') AS chunk LIMIT 1) s"
+    same "$(sql -c "SELECT string_agg(storage||':'||n,',' ORDER BY storage) FROM (SELECT storage,count(*) n FROM index_steward.timescale_storage('public.matrix_events') GROUP BY storage) s")" columnstore:1,rowstore:3
+    same "$(sql -c "$query")" "$before"
+fi
 printf 'Verified B-tree and BRIN on %s with TimescaleDB %s\n' "$("$cfg" --version)" "$version"
