@@ -4,6 +4,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cfg=${1:?Pass pg_config}
 bin=$("$cfg" --bindir)
 lib=$("$cfg" --libdir)
+mode=${2:-native}
+preload=pg_stat_statements,pg_index_steward
+if [[ $mode == timescale ]]; then preload=timescaledb,$preload; fi
 tmp=$(mktemp -d /tmp/pgis-ha.XXXXXX)
 primary="$tmp/primary"
 standby="$tmp/standby"
@@ -21,7 +24,8 @@ mkdir "$PGHOST" "$tmp/standby-sock"
 cat >> "$primary/postgresql.conf" <<EOF
 listen_addresses = ''
 unix_socket_directories = '$PGHOST'
-shared_preload_libraries = 'pg_stat_statements,pg_index_steward'
+shared_preload_libraries = '$preload'
+timescaledb.telemetry_level = 'off'
 timezone = 'UTC'
 pg_index_steward.maintenance_window = '$(date -u -d "1 hour ago" +%H:%M)-$(date -u -d "1 hour" +%H:%M)'
 EOF
@@ -41,12 +45,22 @@ UPDATE index_steward.policy SET min_free_bytes=0;
 SQL
 check "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE signature='upgrade-fixture'")" 1
 sql -c "DELETE FROM index_steward.jobs WHERE signature='upgrade-fixture'"
+if [[ $mode == timescale ]]; then
+    sql <<'SQL'
+CREATE EXTENSION timescaledb;
+CREATE TABLE public.events(ts timestamptz NOT NULL, device int);
+SELECT create_hypertable('public.events','ts',chunk_time_interval=>interval '1 day');
+INSERT INTO public.events SELECT '2026-01-01 UTC'::timestamptz+i*interval '30 seconds', i%100
+  FROM generate_series(1,10000) i;
+SQL
+fi
 cycle --observe-only
-sql <<'SQL'
+if [[ $mode == native ]]; then sql <<'SQL'
 INSERT INTO index_steward.jobs(action,target,signature,detail)
 VALUES('create','public.mixed'::regclass,'promote-fixture',
        '{"schema":"public","table":"mixed","keys":["id"],"index":"pgis_mixed_ha","samples":[]}');
 SQL
+fi
 "$bin/pg_basebackup" -D "$standby" -Xs -R -c fast
 cat >> "$standby/postgresql.conf" <<EOF
 unix_socket_directories = '$tmp/standby-sock'
@@ -55,6 +69,44 @@ EOF
 old_socket=$PGHOST
 export PGHOST="$tmp/standby-sock"
 check "$(sql -c 'SELECT pg_is_in_recovery()')" t
+if [[ $mode == timescale ]]; then
+    export PGHOST="$old_socket"
+    job=$(sql -c "SELECT index_steward.queue_timescale_index('public.events',ARRAY['device','ts']::name[])")
+    chunk=$(sql -c "SELECT show_chunks('public.events') LIMIT 1")
+    coproc locker { sql; }
+    pid=$locker_PID
+    exec {lock_input}>&"${locker[1]}" {lock_output}<&"${locker[0]}"
+    printf '%s\n' 'BEGIN;' "LOCK $chunk IN SHARE UPDATE EXCLUSIVE MODE;" "SELECT 'locked';" >&"$lock_input"
+    read -r -t 10 -u "$lock_output" locked
+    check "$locked" locked
+    cycle
+    check "$(sql -c "SELECT reason FROM index_steward.jobs WHERE id=$job")" 55P03
+    printf '%s\n' 'ROLLBACK;' '\q' >&"$lock_input"
+    wait "$pid"
+    sql -c "UPDATE index_steward.jobs SET next_attempt_at=now() WHERE id=$job"
+    wal=$(sql -c 'SELECT pg_current_wal_flush_lsn()')
+    export PGHOST="$tmp/standby-sock"
+    for _ in {1..100}; do
+        [[ $(sql -c "SELECT pg_last_wal_replay_lsn()>='$wal'::pg_lsn") == t ]] && break
+        sleep .1
+    done
+    check "$(sql -c "SELECT pg_last_wal_replay_lsn()>='$wal'::pg_lsn")" t
+    cycle
+    check "$(sql -c "SELECT state||':'||attempts FROM index_steward.jobs WHERE id=$job")" queued:1
+    "$bin/pg_ctl" -D "$primary" -m immediate -w stop >/dev/null
+    "$bin/pg_ctl" -D "$standby" -w promote >/dev/null
+    cycle
+    check "$(sql -c "SELECT state||':'||attempts FROM index_steward.jobs WHERE id=$job")" queued:1
+    grep -q 'PG Index Steward .*"reason":"failover_grace"' "$tmp/standby.log"
+    sql -c "UPDATE index_steward.policy SET primary_epoch_at=now()-interval '301 seconds'"
+    cycle
+    check "$(sql -c "SELECT reason FROM index_steward.jobs WHERE id=$job")" timescale_rebuild
+    cycle
+    check "$(sql -c "SELECT state||':'||(detail->'coverage'->>'indexed') FROM index_steward.jobs WHERE id=$job")" done:4
+    grep -q 'PG Index Steward .*"event":"timescale_reconciled".*"reason":"timeline_changed"' "$tmp/standby.log"
+    printf 'Replayed and rebuilt a partial hypertable index after fenced promotion\n'
+    exit 0
+fi
 cycle
 check "$(sql -c "SELECT state FROM index_steward.jobs WHERE signature='promote-fixture'")" queued
 # Simulate a fenced former primary. The extension does not fence hosts.

@@ -84,6 +84,8 @@ pg_index_steward.auto_drop_managed = on
 
 PG14 与 TimescaleDB 2.8.0 的混合压缩超表可开启 `policy.timescale_legacy_compression` 后显式排队。功能覆盖该组合的行存索引路径，压缩数据的查询仍由 TimescaleDB 的压缩执行路径处理。已验证范围为本地默认表空间的超表。Hypercore 列存、分布式超表和其他版本组合需要相应的兼容验证。
 
+主备切换后，执行器在 `failover_grace_seconds` 到期后重新核对超表索引。任务记录和索引需要已回放到新主库。隔离测试先停止旧主库，再提升物理备库并验证待恢复索引的全量覆盖。生产的旧主库隔离由高可用系统处理。
+
 HypoPG 1.4.5 的源码随插件编译进 `pg_index_steward.so`。`index_steward.policy.use_hypopg` 默认开启。对部分普通表候选，在执行器连接内以生成的等值模板比较普通 `EXPLAIN` 计划。`detail.plan_evidence` 包含优化器成本与是否使用候选索引。该结果用于理解候选，真实业务效果以建成后的自然流量衡量。
 
 DBA 可在 `index_steward.plan_samples` 登记有代表性的单条 `SELECT` 和绑定值，分别比较通用计划与定制计划，并查看虚拟索引估算体积。仅登记受信任的查询与参数。`index_steward.index_portfolio` 展示候选覆盖的查询数、表写入量及覆盖索引和部分索引建议。`index_steward.relation_hotspots` 按表和查询形态归组规划、执行、I/O 统计和活动会话等待采样。使用外部延迟监控时，可向 `index_steward.latency_samples` 写入按 query ID 聚合的 P95 与样本量。

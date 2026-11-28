@@ -73,6 +73,7 @@ jobs:
           pgconfig=/tmp/pgis-timescale-pg14.19/bin/pg_config
           make PG_CONFIG="$pgconfig" install
           bash tests/timescale.sh "$pgconfig"
+          bash tests/failover.sh "$pgconfig" timescale
 
   package:
     needs: [verify, timescale]

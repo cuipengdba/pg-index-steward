@@ -1001,6 +1001,8 @@ def timescale_reconcile(db, job, index, policy):
         return False
     coverage = timescale_coverage(db, job)
     record_timescale_progress(db, job, coverage)
+    if detail.get('build_epoch') and detail['build_epoch'] != policy['primary_epoch']:
+        event(db, 'timescale_reconciled', job, 'timeline_changed')
     if index['valid'] and index['ready'] and coverage['chunks'] == coverage['indexed']:
         update_job(db, job, 'done', 'Root index is valid and all chunks are covered', 'timescale_complete')
         return False
@@ -1105,6 +1107,7 @@ def timescale_create(db, job, cfg, policy):
     columns = ', '.join(identifier(key) for key in detail['keys'])
     # A durable per-attempt name distinguishes interrupted work from pre-existing indexes.
     detail['index'] = detail['build_intent'] = 'pgist_' + secrets.token_hex(16)
+    detail['build_epoch'] = policy['primary_epoch']
     db.execute(f"UPDATE {SCHEMA}.jobs SET detail={json_value(detail)} WHERE id={job['id']}")
     update_job(db, job, 'running', 'Building hypertable index in chunk transactions', 'timescale_create')
     try:
@@ -1427,7 +1430,9 @@ def run_cycle(db, cfg, allow_ddl):
         if not db.one("SELECT pg_try_advisory_lock(1885825395,176884235) AS held")['held']:
             return
         primary_ready = observe_primary_epoch(db, policy)
-        recover_jobs(db, policy)
+        if primary_ready:
+            policy = db.one(f"SELECT * FROM {SCHEMA}.policy WHERE singleton")
+            recover_jobs(db, policy)
         deltas = workload(db, qstats, info)
         record_diagnostics(db, qstats, deltas)
         propose_indexes(db, qstats, deltas, policy)
