@@ -40,8 +40,9 @@ python3 "$root/bin/pg-index-steward" --libpq "$lib/libpq.so.5" --once
 [[ $(psql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE signature='lock-fixture'") == queued:55P03 ]]
 psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='steward_recovery_fixture'" >/dev/null
 wait "$holder" || true
-psql -c "UPDATE index_steward.jobs SET next_attempt_at='-infinity' WHERE signature='lock-fixture'"
+sleep 1.1
 python3 "$root/bin/pg-index-steward" --libpq "$lib/libpq.so.5" --once
 [[ $(psql -c "SELECT state||':'||attempts FROM index_steward.jobs WHERE signature='lock-fixture'") == done:2 ]]
 [[ $(psql -c "SELECT indisvalid FROM pg_index WHERE indexrelid='public.pgis_retry_target'::regclass") == t ]]
 grep -q 'PG Index Steward .*"reason":"55P03"' "$tmp/log"
+grep -q 'PG Index Steward .*"event":"blocker_cleared".*"reason":"55P03"' "$tmp/log"

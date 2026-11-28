@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.0.0'
+VERSION = '3.1.0'
 
 
 class DatabaseError(RuntimeError):
@@ -685,6 +685,7 @@ def update_job(db, job, state, message, reason=None):
                    reason={literal(reason)},
                    attempts=attempts+CASE WHEN {literal(state)}='running' THEN 1 ELSE 0 END,
                    retry_streak=retry_streak+CASE WHEN {literal(state)}='running' THEN 1 ELSE 0 END,
+                   blocked_since=CASE WHEN {literal(state)} IN ('queued','running') THEN blocked_since END,
                    last_started_at=CASE WHEN {literal(state)}='running' THEN clock_timestamp() ELSE last_started_at END,
                    updated_at=clock_timestamp() WHERE id={job['id']} RETURNING id,attempts)
                    INSERT INTO {SCHEMA}.attempts(job_id,attempt)
@@ -699,9 +700,47 @@ def defer_job(db, job, reason, policy, attempted=False):
     delay = min(3600, base * (2 ** min(streak, 5)))
     rows = db.execute(f"""WITH deferred AS (UPDATE {SCHEMA}.jobs SET state='queued',
                    message={literal(reason)},reason={literal(reason)},
+                   blocked_since=coalesce(blocked_since,clock_timestamp()),updated_at=clock_timestamp(),
                    next_attempt_at=clock_timestamp()+make_interval(secs=>{delay}) WHERE id={job['id']}
                    RETURNING next_attempt_at::text AS retry_at) SELECT retry_at FROM deferred""")
     event(db, 'deferred', job, reason, rows[0])
+
+
+def recheck_blockers(db, cfg, policy):
+    jobs = db.rows(f"""SELECT * FROM {SCHEMA}.jobs WHERE state='queued'
+        AND reason IN ('55P03','long_transaction','replication_lag','disk_headroom','53100')
+        AND next_attempt_at>clock_timestamp() AND updated_at<clock_timestamp()-interval '1 second'
+        ORDER BY updated_at,id LIMIT 20""")
+    for job in jobs:
+        reason, target = job['reason'], int(job['target'])
+        if reason in ('long_transaction', 'replication_lag'):
+            guards = protect(db, job)
+            ready = guards['no_long_xact'] and guards['replication_healthy']
+        elif reason == '55P03':
+            modes = "'ShareUpdateExclusiveLock','ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock'"
+            # TimescaleDB takes a write-conflicting lock on the chunk it is indexing.
+            if job['detail'].get('timescale') or job['action'] == 'drop' or job['detail'].get('partition'):
+                modes += ",'RowExclusiveLock'"
+            ready = db.one(f"""SELECT NOT EXISTS(SELECT FROM pg_locks WHERE locktype='relation'
+                AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+                AND mode IN ({modes}) AND relation IN (
+                    SELECT {target}::oid UNION SELECT indrelid FROM pg_index WHERE indexrelid={target}
+                    UNION SELECT inhrelid FROM pg_inherits WHERE inhparent={target}
+                )) AS ready""")['ready']
+        elif reason == 'disk_headroom' and not job['detail'].get('partition'):
+            inventory = timescale_inventory(db, job) if job['detail'].get('timescale') and timescale_supported(db) else None
+            bytes_needed = inventory['bytes'] if inventory else db.one(f"""SELECT coalesce((SELECT
+                pg_relation_size(oid) FROM pg_class WHERE oid={target}),0) AS bytes""")['bytes']
+            ready = shutil.disk_usage(cfg['data_directory']).free >= max(policy['min_free_bytes'], bytes_needed * 2)
+        else:
+            # ENOSPC can refer to another volume; partition budgets depend on the next child.
+            ready = False
+        if ready:
+            db.execute(f"UPDATE {SCHEMA}.jobs SET next_attempt_at=clock_timestamp(),reason='blocker_cleared',"
+                       f"updated_at=clock_timestamp() WHERE id={job['id']} AND state='queued'")
+            event(db, 'blocker_cleared', job, reason)
+        else:
+            db.execute(f"UPDATE {SCHEMA}.jobs SET updated_at=clock_timestamp() WHERE id={job['id']} AND state='queued'")
 
 
 def reserve_next_window(db, job, cfg):
@@ -1588,6 +1627,7 @@ def run_cycle(db, cfg, allow_ddl):
         if used['jobs'] >= policy['daily_limit']:
             event(db, 'cycle_paused', reason='daily_limit')
             return
+        recheck_blockers(db, cfg, policy)
         jobs = db.rows(f"""SELECT * FROM {SCHEMA}.jobs WHERE state='queued'
                        AND next_attempt_at<=clock_timestamp()
                        AND NOT COALESCE((detail->>'advisory')::boolean,false)
@@ -1602,6 +1642,7 @@ def run_cycle(db, cfg, allow_ddl):
                        ORDER BY COALESCE((detail->>'rollback')::boolean,false) DESC,
                                 (created_at<clock_timestamp()-interval '2 days') DESC,
                                 CASE WHEN created_at<clock_timestamp()-interval '2 days' THEN created_at END,
+                                (reason='blocker_cleared') DESC NULLS LAST,
                                 (reason='window_capacity') DESC NULLS LAST,
                                 action='create' DESC, COALESCE((detail->>'score')::float8, 0) DESC,id LIMIT 50""")
         completed_steps = 0
