@@ -55,6 +55,19 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-22.04, ubuntu-22.04-arm]
+        pair:
+          - {pg: '14.19', ts: '2.8.0', experimental: 'OFF'}
+          - {pg: '14.25', ts: '2.19.3', experimental: 'OFF'}
+          - {pg: '15.20', ts: '2.19.3', experimental: 'OFF'}
+          - {pg: '16.16', ts: '2.32.1', experimental: 'OFF'}
+          - {pg: '17.12', ts: '2.32.1', experimental: 'OFF'}
+          - {pg: '18.7', ts: '2.32.1', experimental: 'OFF'}
+          - {pg: '19.0', ts: '2.32.1', experimental: 'ON'}
+    env:
+      FIXTURE: /tmp/pgis-timescale-${{ matrix.pair.pg }}-${{ matrix.pair.ts }}
+      FIXTURE_PG: ${{ matrix.pair.pg }}
+      FIXTURE_TS: ${{ matrix.pair.ts }}
+      FIXTURE_EXPERIMENTAL: ${{ matrix.pair.experimental }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -62,18 +75,25 @@ jobs:
         id: fixture
         uses: actions/cache@v4
         with:
-          path: /tmp/pgis-timescale-pg14.19
-          key: timescale-2.8.0-pg14.19-${{ matrix.runner }}-${{ hashFiles('scripts/build-timescale-fixture.sh') }}
+          path: ${{ env.FIXTURE }}
+          key: timescale-${{ env.FIXTURE_TS }}-pg${{ env.FIXTURE_PG }}-${{ matrix.runner }}-${{ hashFiles('scripts/build-timescale-fixture.sh') }}
       - name: Build isolated TimescaleDB fixture
         if: steps.fixture.outputs.cache-hit != 'true'
-        run: bash scripts/build-timescale-fixture.sh /tmp/pgis-timescale-pg14.19
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bison flex liblz4-dev libzstd-dev
+          bash scripts/build-timescale-fixture.sh "$FIXTURE" "$FIXTURE_PG" "$FIXTURE_TS" "$FIXTURE_EXPERIMENTAL"
       - name: Verify real hypertable index creation
         run: |
           set -euo pipefail
-          pgconfig=/tmp/pgis-timescale-pg14.19/bin/pg_config
+          pgconfig="$FIXTURE/bin/pg_config"
           make PG_CONFIG="$pgconfig" install
-          bash tests/timescale.sh "$pgconfig"
-          bash tests/failover.sh "$pgconfig" timescale
+          if [[ $FIXTURE_TS == 2.8.0 ]]; then
+            bash tests/timescale.sh "$pgconfig"
+            bash tests/failover.sh "$pgconfig" timescale
+          else
+            bash tests/timescale-matrix.sh "$pgconfig" "$FIXTURE_TS" "$FIXTURE_EXPERIMENTAL"
+          fi
 
   package:
     needs: [verify, timescale]

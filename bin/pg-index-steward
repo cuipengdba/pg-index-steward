@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.1.0'
+VERSION = '3.2.0'
 
 
 class DatabaseError(RuntimeError):
@@ -941,10 +941,16 @@ def timescale_inventory(db, job):
         AND h.hypertable_schema={literal(detail['schema'])} AND h.hypertable_name={literal(detail['table'])}""")
 
 
-def timescale_supported(db):
-    return db.one(f"""SELECT EXISTS(SELECT FROM pg_extension e JOIN {SCHEMA}.timescale_compatibility m
+def timescale_mode(db):
+    row = db.one(f"""SELECT m.coverage_mode FROM pg_extension e JOIN {SCHEMA}.timescale_compatibility m
         ON m.extension_version=e.extversion AND m.pg_major=current_setting('server_version_num')::int/10000
-        WHERE e.extname='timescaledb') AS supported""")['supported']
+        CROSS JOIN {SCHEMA}.policy p WHERE e.extname='timescaledb' AND p.singleton
+        AND (NOT m.experimental OR p.timescale_experimental)""")
+    return row['coverage_mode'] if row else None
+
+
+def timescale_supported(db):
+    return timescale_mode(db) is not None
 
 
 def propose_timescale(db, deltas, policy):
@@ -1006,6 +1012,20 @@ def propose_timescale(db, deltas, policy):
 
 def timescale_coverage(db, job):
     detail = job['detail']
+    if timescale_mode(db) == 'definition':
+        return db.one(f"""SELECT count(*) AS chunks,count(*) FILTER (WHERE EXISTS (
+           SELECT FROM pg_index i JOIN pg_class ci ON ci.oid=i.indexrelid
+           JOIN pg_am am ON am.oid=ci.relam
+           WHERE i.indrelid=h.inhrelid AND i.indisvalid AND i.indisready AND i.indislive
+             AND i.indnkeyatts=i.indnatts AND i.indnatts={len(detail['keys'])}
+             AND NOT i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL
+             AND am.amname={literal(detail['method'])}
+             AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(attnum,pos)
+                        JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+                        JOIN pg_opclass op ON op.oid=i.indclass[k.pos::int-1] AND op.opcdefault
+                        WHERE i.indcollation[k.pos::int-1]=a.attcollation AND i.indoption[k.pos::int-1]=0
+                        ORDER BY k.pos)=ARRAY[{','.join(literal(key) for key in detail['keys'])}]::text[]
+        )) AS indexed FROM pg_inherits h WHERE h.inhparent={job['target']}""")
     return db.one(f"""SELECT count(*) AS chunks,count(*) FILTER (WHERE EXISTS (
         SELECT FROM _timescaledb_catalog.chunk ch
         JOIN _timescaledb_catalog.chunk_index m ON m.chunk_id=ch.id AND m.hypertable_id=ch.hypertable_id
@@ -1059,6 +1079,9 @@ def timescale_reconcile(db, job, index, policy):
         return False
     if index['valid']:
         update_job(db, job, 'failed', 'Inspect valid root with incomplete chunk coverage', 'timescale_coverage')
+        return False
+    if timescale_mode(db) == 'definition':
+        update_job(db, job, 'failed', 'Invalid root requires inspection of equivalent chunk indexes', 'timescale_definition_review')
         return False
     budget = ddl_budget(db, policy, job)
     if not budget:
@@ -1221,7 +1244,8 @@ def timescale_usage(db, job, index):
 
 
 def observe_timescale_indexes(db, policy):
-    if not timescale_supported(db):
+    mode = timescale_mode(db)
+    if not mode:
         return
     builds = db.rows(f"""SELECT j.* FROM {SCHEMA}.jobs j LEFT JOIN {SCHEMA}.timescale_usage u ON u.build_job=j.id
         WHERE j.state='done' AND j.action='create' AND j.detail @> '{{"timescale":true}}'::jsonb
@@ -1239,6 +1263,8 @@ def observe_timescale_indexes(db, policy):
         if coverage != detail.get('coverage'):
             record_timescale_progress(db, job, coverage)
             event(db, 'timescale_coverage_changed', job, 'chunk_inventory')
+        if mode != 'catalog':
+            continue
         usage = timescale_usage(db, job, index)
         if not usage:
             continue
@@ -1260,7 +1286,7 @@ def retire_timescale_index(db, job, guards, policy):
     if not policy['timescale_retirement'] or not guards['no_replica_evidence'] or policy['replica_services']:
         defer_job(db, job, 'timescale_retirement_policy' if not policy['timescale_retirement'] else 'replica_usage_unverified', policy)
         return False
-    if not timescale_supported(db):
+    if timescale_mode(db) != 'catalog':
         update_job(db, job, 'cancelled', 'TimescaleDB pairing changed', 'timescale_version')
         return False
     build = db.one(f"SELECT * FROM {SCHEMA}.jobs WHERE id={job['detail']['build_job']} AND state='done' AND action='create'")

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 prefix=$(realpath -m "${1:?Pass an isolated PostgreSQL install prefix}")
-pg_version=14.19
-ts_version=2.8.0
+pg_version=${2:-14.19}
+ts_version=${3:-2.8.0}
+experimental=${4:-OFF}
 [[ ! -e $prefix/bin/pg_config ]] || { echo "Fixture prefix already exists: $prefix" >&2; exit 1; }
 build=$(mktemp -d)
 trap 'rm -rf -- "$build"' EXIT
@@ -22,6 +23,7 @@ tar xzf timescaledb.tar.gz
     make -s install-world-bin
 )
 cmake -S "timescaledb-$ts_version" -B ts-build -DPG_CONFIG="$prefix/bin/pg_config" \
-    -DREGRESS_CHECKS=OFF -DWARNINGS_AS_ERRORS=OFF -DSEND_TELEMETRY_DEFAULT=OFF -DCMAKE_BUILD_TYPE=Release -DUSE_OPENSSL=0
+    -DREGRESS_CHECKS=OFF -DWARNINGS_AS_ERRORS=OFF -DSEND_TELEMETRY_DEFAULT=OFF -DCMAKE_BUILD_TYPE=Release \
+    -DUSE_OPENSSL=OFF -DEXPERIMENTAL="$experimental"
 cmake --build ts-build --parallel "${PGIS_BUILD_JOBS:-3}"
 cmake --install ts-build

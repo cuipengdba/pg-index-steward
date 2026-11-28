@@ -82,7 +82,16 @@ pg_index_steward.auto_drop_managed = on
 
 `policy.timescale_build_mib_per_second` 用于按数据量估算初始构建时间。`detail.build_estimate` 和 `detail.build_elapsed_seconds` 可用于调整估算。超出窗口或配置上限时，任务记录 `timescale_budget_policy` 并保留重试资格。
 
-PG14 与 TimescaleDB 2.8.0 的混合压缩超表可开启 `policy.timescale_legacy_compression` 后显式排队。功能覆盖该组合的行存索引路径，压缩数据的查询仍由 TimescaleDB 的压缩执行路径处理。已验证范围为本地默认表空间的超表。Hypercore 列存、分布式超表和其他版本组合需要相应的兼容验证。
+本地默认表空间的行存超表支持以下组合。安装 TimescaleDB 后，再启用 Steward 的索引任务。
+
+| PostgreSQL | TimescaleDB | 构建 |
+| --- | --- | --- |
+| 14 | 2.8.0、2.19.3 | 正式 |
+| 15 | 2.19.3 | 正式 |
+| 16、17、18 | 2.32.1 | 正式 |
+| 19 | 2.32.1 | 上游实验构建 `-DEXPERIMENTAL=ON`，另需开启 `policy.timescale_experimental` |
+
+PG14 与 TimescaleDB 2.8.0 的混合压缩超表可开启 `policy.timescale_legacy_compression` 后显式排队。该组合的索引覆盖行存路径，压缩数据的查询由 TimescaleDB 的压缩执行路径处理。新版按索引定义核对覆盖，中断后留下无效根索引的任务进入人工审查。
 
 主备切换后，执行器在 `failover_grace_seconds` 到期后重新核对超表索引。任务记录和索引需要已回放到新主库。隔离测试先停止旧主库，再提升物理备库并验证待恢复索引的全量覆盖。生产的旧主库隔离由高可用系统处理。
 
