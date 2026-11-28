@@ -78,6 +78,8 @@ pg_index_steward.auto_drop_managed = on
 
 超表索引任务保存每次构建使用的随机名称。中断后执行器核对索引定义及分块覆盖。有效且覆盖完整的索引直接验收。执行器只在维护窗口清理定义和身份仍匹配的自建无效索引，再从头构建。旧版本遗留的无效索引由 DBA 审核。
 
+`policy.timescale_discovery` 默认为 `advice`，从现有查询统计和列统计生成候选。调用 `queue_timescale_index(regclass,name[])` 批准对应候选。三参数版本接受 `btree` 和单列 `brin`。设置 `execute` 后，满足策略的候选可自动执行。`off` 停止发现。范围列与物理顺序高度相关、块足够大且已有 B-tree 不覆盖该列时，执行器才会推荐 BRIN。
+
 HypoPG 1.4.5 的源码随插件编译进 `pg_index_steward.so`。`index_steward.policy.use_hypopg` 默认开启。对部分普通表候选，在执行器连接内以生成的等值模板比较普通 `EXPLAIN` 计划。`detail.plan_evidence` 包含优化器成本与是否使用候选索引。该结果用于理解候选，真实业务效果以建成后的自然流量衡量。
 
 DBA 可在 `index_steward.plan_samples` 登记有代表性的单条 `SELECT` 和绑定值，分别比较通用计划与定制计划，并查看虚拟索引估算体积。仅登记受信任的查询与参数。`index_steward.index_portfolio` 展示候选覆盖的查询数、表写入量及覆盖索引和部分索引建议。`index_steward.relation_hotspots` 按表和查询形态归组规划、执行、I/O 统计和活动会话等待采样。使用外部延迟监控时，可向 `index_steward.latency_samples` 写入按 query ID 聚合的 P95 与样本量。

@@ -88,4 +88,26 @@ same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE state='queued' AND
 worker
 same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE state='done' AND detail->'coverage'->>'indexed'='4'")" 3
 grep -q 'PG Index Steward .*"reason":"timescale_rebuild"' "$tmp/server.log"
+
+sql <<'SQL'
+CREATE TABLE public.metrics(ts timestamptz NOT NULL, device int NOT NULL, payload text);
+SELECT create_hypertable('public.metrics','ts',chunk_time_interval=>interval '1 day',create_default_indexes=>false);
+INSERT INTO public.metrics SELECT '2026-01-01 UTC'::timestamptz+i*interval '1 second', i%10000,repeat('b',500)
+  FROM generate_series(0,49999) i;
+ANALYZE public.metrics;
+SELECT pg_sleep(0.06), count(*) FROM public.metrics WHERE device=42 AND ts >= '2026-01-01 UTC';
+SQL
+worker
+sql <<'SQL'
+SELECT 'SELECT pg_sleep(0.06), count(*) FROM public.metrics WHERE device=42 AND ts >= ''2026-01-01 UTC'';' FROM generate_series(1,20) \gexec
+SQL
+worker
+same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='metrics' AND detail @> '{\"advisory\":true,\"method\":\"btree\",\"source\":\"workload\"}'")" 1
+sql -c "SELECT index_steward.queue_timescale_index('public.metrics',ARRAY['device','ts']::name[]);"
+worker
+same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='metrics' AND state='done' AND detail->>'method'='btree'")" 1
+sql -c "SELECT index_steward.queue_timescale_index('public.metrics',ARRAY['ts']::name[],'brin');"
+worker
+same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='metrics' AND state='done' AND detail->>'method'='brin' AND detail->'coverage'->>'indexed'='1'")" 1
+same "$(sql -c "SELECT count(*) FROM public.metrics WHERE device=42 AND ts >= '2026-01-01 UTC'")" 5
 printf 'TimescaleDB chunk coverage and index adoption verified on %s\n' "$("$cfg" --version)"
