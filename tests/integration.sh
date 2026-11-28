@@ -49,20 +49,27 @@ same "$(PGDATABASE=steward_fresh_install sql "SELECT extversion FROM pg_extensio
 sql 'CREATE DATABASE steward_upgrade_30' >/dev/null
 PGDATABASE=steward_upgrade_30 psql -q <<'SQL'
 CREATE EXTENSION pg_stat_statements;
-CREATE EXTENSION pg_index_steward VERSION '3.0.0';
+CREATE EXTENSION pg_index_steward VERSION '3.10.0';
 CREATE TABLE public.legacy_events(ts int);
 UPDATE index_steward.policy SET rollout_percent=70;
 INSERT INTO index_steward.jobs(action,target,signature,detail,state,reason)
-VALUES ('create','public.legacy_events'::regclass,'retained','{}','queued','55P03');
+VALUES ('create','public.legacy_events'::regclass,'retained','{"timescale":true}','queued','55P03');
 ALTER EXTENSION pg_index_steward UPDATE;
 CREATE ROLE steward_reporter LOGIN;
 GRANT USAGE ON SCHEMA index_steward TO steward_reporter;
 GRANT EXECUTE ON FUNCTION index_steward.maintenance_report(integer) TO steward_reporter;
+GRANT EXECUTE ON FUNCTION index_steward.timeseries_report(integer) TO steward_reporter;
 SQL
 same "$(PGDATABASE=steward_upgrade_30 sql "SELECT rollout_percent FROM index_steward.policy")" 70
 same "$(PGDATABASE=steward_upgrade_30 sql "SELECT state||':'||reason FROM index_steward.jobs WHERE signature='retained'")" queued:55P03
 same "$(PGDATABASE=steward_upgrade_30 sql "SELECT has_table_privilege('steward_reporter','index_steward.jobs','SELECT')")" f
-PGDATABASE=steward_upgrade_30 PGUSER=steward_reporter worker --report --days 7 | python3 -c 'import json,sys; r=json.load(sys.stdin)[0]["report"]; assert r["days"] == 7 and r["jobs"]["pending"] == 1 and r["blockers"][0]["reason"] == "55P03"'
+PGDATABASE=steward_upgrade_30 PGUSER=steward_reporter worker --report --days 7 | python3 -c 'import json,sys; r=json.load(sys.stdin)[0]["report"]; assert r["days"] == 7 and r["jobs"]["pending"] == 1 and r["blockers"][0]["reason"] == "55P03"; ts=r["timeseries"]; assert ts["pair"]["support"] == "not_installed" and ts["jobs"][0]["pending"] == 1 and ts["blockers"][0]["reason"] == "55P03"'
+sql 'CREATE DATABASE steward_upgrade_steps' >/dev/null
+PGDATABASE=steward_upgrade_steps sql "CREATE EXTENSION pg_stat_statements; CREATE EXTENSION pg_index_steward VERSION '3.10.0'" >/dev/null
+for minor in {11..20}; do
+    PGDATABASE=steward_upgrade_steps sql "ALTER EXTENSION pg_index_steward UPDATE TO '3.$minor.0'" >/dev/null
+done
+same "$(PGDATABASE=steward_upgrade_steps sql "SELECT extversion FROM pg_extension WHERE extname='pg_index_steward'")" "$version"
 same "$(sql "SELECT auto_create||','||maintenance_window||','||auto_drop_existing||','||auto_drop_managed FROM index_steward.settings()")" 'true,23:00-06:00,false,true'
 same "$(sql "SELECT index_steward.candidates('SELECT * FROM public.devices WHERE id=42')->0->>'table'")" devices
 same "$(sql "SELECT index_steward.candidates('SELECT * FROM devices WHERE id=1; SELECT 1')")" '[]'

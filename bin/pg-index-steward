@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.19.0'
+VERSION = '3.20.0'
 
 
 class DatabaseError(RuntimeError):
@@ -1495,16 +1495,28 @@ def hypercore_rebuild(db, job, cfg, budget, policy):
                      f" OR v.orderby IS DISTINCT FROM {literal(desired['orderby'])}")
     scope = ''
     if rollback:
-        scope = f" AND c.oid IN ({','.join(str(int(oid)) for oid in detail['rollback_chunks'])})"
+        previous = detail['before']
+        scope = (f" AND (c.oid IN ({','.join(str(int(oid)) for oid in detail['rollback_chunks'])})"
+                 f" OR (v.segmentby IS NOT DISTINCT FROM {literal(previous['segmentby'])}"
+                 f" AND v.orderby IS NOT DISTINCT FROM {literal(previous['orderby'])}"
+                 f" AND v.index IS NOT DISTINCT FROM {json_value(previous['sparse_indexes'])}))")
     target = timescale_inventory(db, job)
     if not target or target['distributed'] or target['tablespace'] or target['external_tablespace']:
         update_job(db, job, 'cancelled', 'Hypertable layout changed', 'hypercore_identity')
         return False
+    bytes_required = 'pg_total_relation_size(s.compress_relid)'
+    if layout:
+        bytes_required = f'greatest({bytes_required},coalesce(sizes.rowstore_bytes,0),pg_total_relation_size(c.oid))'
     chunk = db.one(f"""SELECT c.oid,n.nspname AS schema_name,c.relname AS chunk_name,
-        pg_total_relation_size(s.compress_relid) AS bytes, c.relfilenode
+        {bytes_required} AS bytes, c.relfilenode
         FROM timescaledb_information.chunk_columnstore_settings v
         JOIN pg_class c ON c.oid=v.chunk JOIN pg_namespace n ON n.oid=c.relnamespace
         JOIN _timescaledb_catalog.compression_settings s ON s.relid=c.oid
+        JOIN _timescaledb_catalog.chunk catalog_chunk ON catalog_chunk.relid=c.oid
+        LEFT JOIN LATERAL (
+            SELECT sum(u.uncompressed_heap_size+u.uncompressed_toast_size+u.uncompressed_index_size) AS rowstore_bytes
+            FROM _timescaledb_catalog.compression_chunk_size u WHERE u.chunk_id=catalog_chunk.id
+        ) sizes ON true
         JOIN pg_inherits h ON h.inhrelid=c.oid AND h.inhparent={parent}
         WHERE v.hypertable={parent} AND ({mismatch}){scope}
         ORDER BY c.oid LIMIT 1""")
@@ -2121,7 +2133,8 @@ def main():
                     rows = db.rows(f'SELECT * FROM {SCHEMA}.queue_status({args.after_id},{args.page_size}) ORDER BY id')
                 elif args.report:
                     key = 'report'
-                    rows = json.loads(db.execute(f'SELECT {SCHEMA}.maintenance_report({args.days})')[0])
+                    rows = db.one(f"""SELECT {SCHEMA}.maintenance_report({args.days}) ||
+                        jsonb_build_object('timeseries',{SCHEMA}.timeseries_report({args.days})) AS report""")['report']
                 else:
                     rows = report(db, args.metrics, service, headers=position == 0)
                 if rows is not None:

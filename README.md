@@ -13,8 +13,8 @@ PG Index Steward 根据 `pg_stat_statements` 的自然流量统计生成索引�
 从 [GitHub Releases](https://github.com/cuipengdba/pg-index-steward/releases) 下载本机架构的 `.tar.gz`。两个架构包各自包含 PG14、15、16、17、18、19 对应的动态库。Linux 预编译包面向 glibc 环境。自定义 PostgreSQL 二进制 ABI、不同 C 库或系统装载失败时，使用目标实例的 `pg_config` 源码编译。PG14 上游维护已结束。
 
 ```bash
-tar -xzf pg-index-steward-3.10.0-linux-x86_64.tar.gz
-cd pg-index-steward-3.10.0-linux-x86_64
+tar -xzf pg-index-steward-3.20.0-linux-x86_64.tar.gz
+cd pg-index-steward-3.20.0-linux-x86_64
 sudo ./install.sh \
   --pg-config /opt/pgsql/bin/pg_config \
   --data-dir /srv/pgsql/data \
@@ -31,7 +31,7 @@ CREATE EXTENSION IF NOT EXISTS pg_index_steward;
 SELECT * FROM index_steward.settings();
 ```
 
-升级已有实例时，先停止执行器并备份数据库和原安装包，再用新安装包的 `--files-only` 更新文件。安排重启 PostgreSQL 加载新动态库，在各目标数据库执行 `ALTER EXTENSION pg_index_steward UPDATE TO '3.10.0';`，核对配置与 `SELECT * FROM index_steward.status();` 后恢复执行器。执行器版本通过 `pg-index-steward --version` 查看，须与目标数据库中的扩展版本一致。升级 SQL 从 0.1.0 起逐级保留现有策略和队列。回退整个扩展版本时，使用升级前备份恢复扩展的数据库对象和原安装包。
+升级已有实例时，先停止执行器并备份数据库和原安装包，再用新安装包的 `--files-only` 更新文件。安排重启 PostgreSQL 加载新动态库，在各目标数据库执行 `ALTER EXTENSION pg_index_steward UPDATE TO '3.20.0';`，核对配置与 `SELECT * FROM index_steward.status();` 后恢复执行器。执行器版本通过 `pg-index-steward --version` 查看，须与目标数据库中的扩展版本一致。升级 SQL 从 0.1.0 起逐级保留现有策略和队列。回退整个扩展版本时，使用升级前备份恢复扩展的数据库对象和原安装包。
 
 未使用 systemd 时，可以由已有任务管理器执行以下命令，或去掉 `--once` 作为常驻进程。使用 libpq 原有的本机连接参数或认证文件指定目标。
 
@@ -93,7 +93,23 @@ pg_index_steward.auto_drop_managed = on
 
 PG14 与 TimescaleDB 2.8.0 的混合压缩超表可开启 `policy.timescale_legacy_compression` 后显式排队。该组合的索引覆盖行存路径，压缩数据的查询由 TimescaleDB 的压缩执行路径处理。新版按索引定义核对覆盖。中断后若所有等价块索引的归属均能确认，执行器在维护窗口清理无效根索引并安排重建。归属不明确时进入人工审查。
 
-`SELECT * FROM index_steward.timescale_storage('public.events');` 展示行存、压缩或列存状态，并在 TimescaleDB 提供相关视图时展示分段和排序设置。Hypercore 列存支持诊断，建索引测试覆盖本地行存超表。
+`SELECT * FROM index_steward.timescale_pair_status();` 查看当前 PG 与 TimescaleDB 组合的兼容级别。PG19 尚待 TimescaleDB 上游正式支持和双架构验收。`index_steward.timescale_storage(regclass)` 展示行存、压缩和列存块。
+
+### Hypercore 列存优化
+
+PG16–18 与 TimescaleDB 2.32.1 支持以下列存变更。DBA 先设置超表白名单，再显式开启 `policy.hypercore_changes` 并排队。执行仍受维护窗口、锁等待、磁盘、复制和配额保护。
+
+| SQL 接口 | 操作 |
+| --- | --- |
+| `hypercore_settings(regclass)` | 查看分段、排序和稀疏索引设置 |
+| `queue_hypercore_sparse(regclass,name,name)` | 为后续转换设置 Bloom 等值列和 minmax 范围列。已有显式稀疏配置交由 DBA 审核 |
+| `queue_hypercore_rebuild(regclass)` | 在稀疏配置任务完成后，逐块原位重建已有列存块的元数据 |
+| `queue_hypercore_layout(regclass,name,name)` | 设置单列 `segmentby` 和单列 `orderby`，将已有列存块逐块转换到新布局 |
+| `approve_hypercore_rollback(bigint)` | 对进入退化审核的布局任务，排队恢复原布局并逐块处理已受影响的列存块 |
+
+开启 `policy.hypercore_validate_batches` 后，布局任务转换首块并等待自然流量验收。达到采样条件后，执行器按可比调用量评估每次耗时和读块，证据满足阈值时恢复后续块。样本不足时保持等待。变更前后配置、块进度及回退状态可在任务队列中核对。
+
+隔离测试在 PG18.7 与 TimescaleDB 2.32.1 上，对 16 万行数据原位更新稀疏索引。每条原 SQL 热身 10 次，测量 100 次执行时间。一次运行中，Bloom 等值查询的执行 P95 从 9.929 ms 降至 1.445 ms，minmax 范围查询从 0.996 ms 降至 0.134 ms。两条查询结果一致。该数据用于验证测试负载，生产效果以自然流量实测为准。
 
 主备切换后，执行器在 `failover_grace_seconds` 到期后重新核对超表索引。任务记录和索引需要已回放到新主库。隔离测试先停止旧主库，再提升物理备库并验证待恢复索引的全量覆盖。生产的旧主库隔离由高可用系统处理。
 
@@ -131,7 +147,7 @@ pg-index-steward --alerts --service primary_a --service primary_b
 pg-index-steward --report --days 30 --service primary_a --service primary_b
 ```
 
-`maintenance_report(integer)` 按任务入队时间汇总完成率、阻塞时长和收益验收状态。监控账号需要 `USAGE ON SCHEMA index_steward` 和该函数的执行权限。
+`maintenance_report(integer)` 汇总任务完成率、阻塞时长和收益验收状态。`timeseries_report(integer)` 额外展示时序任务类型、兼容级别和下次复查时间，并保留超过查询周期的未完成任务。使用 CLI 的 `--report` 时，监控账号需要 `USAGE ON SCHEMA index_steward` 和这两个函数的执行权限。
 
 `index_steward.set_paused(true)` 暂停新的数据库变更。`policy.rollout_percent` 控制纳入执行范围的表比例。可用 `index_steward.protect_index('schema.index_name', '2099-12-31')` 为周期任务保留索引。主备切换沿用业务既有的旧主隔离流程，执行器在发现新 WAL 时间线后按 `policy.failover_grace_seconds` 等待，并重新建立闲置观察基线。
 
@@ -147,7 +163,7 @@ pg-index-steward --report --days 30 --service primary_a --service primary_b
 
 ```bash
 sha256sum -c SHA256SUMS --ignore-missing
-gh attestation verify pg-index-steward-3.10.0-linux-x86_64.tar.gz \
+gh attestation verify pg-index-steward-3.20.0-linux-x86_64.tar.gz \
   --repo cuipengdba/pg-index-steward --bundle provenance.jsonl \
   --custom-trusted-root trusted_root.jsonl
 ```
