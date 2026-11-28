@@ -110,4 +110,16 @@ sql -c "SELECT index_steward.queue_timescale_index('public.metrics',ARRAY['ts']:
 worker
 same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='metrics' AND state='done' AND detail->>'method'='brin' AND detail->'coverage'->>'indexed'='1'")" 1
 same "$(sql -c "SELECT count(*) FROM public.metrics WHERE device=42 AND ts >= '2026-01-01 UTC'")" 5
+
+sql <<'SQL'
+UPDATE index_steward.policy SET ddl_timeout_seconds=30,timescale_build_mib_per_second=1;
+SELECT index_steward.queue_timescale_index('public.metrics',ARRAY['payload']::name[]);
+SELECT index_steward.queue_timescale_index('public.gps',ARRAY['recorded_at','device_id']::name[]);
+SQL
+worker
+same "$(sql -c "SELECT reason FROM index_steward.jobs WHERE detail->>'table'='metrics' AND detail->'keys'='[\"payload\"]'")" timescale_budget_policy
+same "$(sql -c "SELECT state FROM index_steward.jobs WHERE detail->'keys'='[\"recorded_at\",\"device_id\"]'")" done
+sql -c "UPDATE index_steward.policy SET ddl_timeout_seconds=1800; UPDATE index_steward.jobs SET next_attempt_at=now() WHERE reason='timescale_budget_policy';"
+worker
+same "$(sql -c "SELECT state FROM index_steward.jobs WHERE detail->>'table'='metrics' AND detail->'keys'='[\"payload\"]'")" done
 printf 'TimescaleDB chunk coverage and index adoption verified on %s\n' "$("$cfg" --version)"

@@ -7,6 +7,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -710,6 +711,11 @@ def reserve_next_window(db, job, cfg):
     event(db, 'deferred', job, 'window_capacity', retry[0])
 
 
+def window_capacity(window):
+    start, end = window.split('-')
+    return seconds_remaining(window, start + ':00')
+
+
 def retryable(error):
     return error.sqlstate in ('55P03', '57014', '40P01', '40001', '53100')
 
@@ -738,7 +744,7 @@ def ddl_budget(db, policy, job):
         return 0
     # Give a timed-out build another chance with a larger budget, subject to
     # both the operator's ceiling and the time left in the current window.
-    timeout = min(current['ddl_timeout_seconds'], 1800 * (2 ** min(job['retry_streak'], 3)))
+    timeout = min(current['ddl_timeout_seconds'], max(required - 5, 1800 * (2 ** min(job['retry_streak'], 3))))
     return min(seconds - 5, timeout)
 
 
@@ -1033,6 +1039,21 @@ def timescale_reconcile(db, job, index, policy):
     return True
 
 
+def timescale_build_budget(db, job, target, cfg, policy):
+    rate = policy['timescale_build_mib_per_second'] * MIB
+    estimate = max(MIN_DDL_WINDOW_SECONDS, math.ceil((target['bytes'] + target['largest_chunk']) / rate)
+                   + math.ceil(target['chunks'] / 4) + 5)
+    need = max(estimate, job['required_seconds'])
+    job['detail']['build_estimate'] = {'seconds': need, 'bytes': target['bytes'], 'largest_chunk': target['largest_chunk']}
+    db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{build_estimate}}',"
+               f"{json_value(job['detail']['build_estimate'])}) "
+               f"WHERE id={job['id']}")
+    if need > min(policy['ddl_timeout_seconds'] + 5, window_capacity(cfg['maintenance_window'])):
+        defer_job(db, job, 'timescale_budget_policy', policy)
+        return 0
+    return ddl_budget(db, policy, {**job, 'required_seconds': need})
+
+
 def timescale_create(db, job, cfg, policy):
     detail = job['detail']
     if not policy['timescale_create']:
@@ -1067,9 +1088,10 @@ def timescale_create(db, job, cfg, policy):
     if shutil.disk_usage(cfg['data_directory']).free < max(policy['min_free_bytes'], 2 * target['bytes']):
         defer_job(db, job, 'disk_headroom', policy)
         return False
-    budget = ddl_budget(db, policy, job)
+    budget = timescale_build_budget(db, job, target, cfg, policy)
     if not budget:
         return False
+    started = time.monotonic()
     qualified = relation(detail['schema'], detail['table'])
     columns = ', '.join(identifier(key) for key in detail['keys'])
     # A durable per-attempt name distinguishes interrupted work from pre-existing indexes.
@@ -1086,9 +1108,16 @@ def timescale_create(db, job, cfg, policy):
         if not index or not index['valid'] or not index['ready'] or coverage['chunks'] != coverage['indexed']:
             update_job(db, job, 'failed', 'Hypertable index coverage requires repair', 'timescale_coverage')
         else:
+            elapsed = max(1, math.ceil(time.monotonic() - started))
+            db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{build_elapsed_seconds}}',"
+                       f"to_jsonb({elapsed})) WHERE id={job['id']}")
             update_job(db, job, 'done', 'Root index is valid and all chunks are covered', 'timescale_complete')
     except DatabaseError as error:
         if retryable(error):
+            if error.sqlstate == '57014' and time.monotonic() - started >= budget - 1:
+                capacity = min(policy['ddl_timeout_seconds'] + 5, window_capacity(cfg['maintenance_window']))
+                db.execute(f"UPDATE {SCHEMA}.jobs SET required_seconds=greatest(required_seconds,"
+                           f"{min(capacity, budget * 2 + 5)}) WHERE id={job['id']}")
             defer_job(db, job, error.sqlstate, policy, attempted=True)
         else:
             update_job(db, job, 'failed', 'Hypertable build requires inspection', 'timescale_interrupted')
@@ -1429,6 +1458,7 @@ def run_cycle(db, cfg, allow_ddl):
                        ORDER BY COALESCE((detail->>'rollback')::boolean,false) DESC,
                                 (created_at<clock_timestamp()-interval '2 days') DESC,
                                 CASE WHEN created_at<clock_timestamp()-interval '2 days' THEN created_at END,
+                                (reason='window_capacity') DESC NULLS LAST,
                                 action='create' DESC, COALESCE((detail->>'score')::float8, 0) DESC,id LIMIT 50""")
         for job in jobs:
             cfg = settings(db)
