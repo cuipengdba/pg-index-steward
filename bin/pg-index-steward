@@ -681,9 +681,6 @@ def update_job(db, job, state, message, reason=None):
 
 def defer_job(db, job, reason, policy, attempted=False):
     streak = job['retry_streak'] + int(attempted)
-    if attempted and streak >= policy['retry_limit']:
-        update_job(db, job, 'failed', f'Retry limit reached ({reason})', 'retry_limit')
-        return
     base = {'55P03': 30, '40P01': 60, 'disk_headroom': 300, '53100': 300,
             'replication_lag': 180, '57014': 180}.get(reason, 120)
     delay = min(3600, base * (2 ** min(streak, 5)))

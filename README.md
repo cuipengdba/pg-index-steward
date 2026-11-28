@@ -72,9 +72,9 @@ pg_index_steward.auto_drop_managed = on
 
 执行器比较累计统计的增量，使用 PostgreSQL 原生语法解析器提取带 schema 的单表 `SELECT` 以及可分析的 `UNION` 分支。支持常见的等值、短 `IN` 和单一列范围谓词，根据列统计、缓冲区工作量和已有 B-tree 前缀筛选普通表非唯一索引。候选使用采样期间的累计耗时排序。解析和校验只针对已保存的工作负载文本，执行器只生成自己的 DDL。
 
-任务进入持久化队列并等待维护窗口。执行前重新检查对象、索引重叠、磁盘余量、长事务、复制状态和窗口余额。受阻任务保留 `next_attempt_at`，调度器继续处理下一条符合条件的任务。等待两天的任务优先，锁冲突、超时等可重试错误按退避时间重排。若达到重试上限，可在处理根因后用 `index_steward.retry_job(id)` 重新激活。超过七天没有新证据的普通表建索引候选等待下一次负载采样更新。闲置删除后同一候选有七天重新创建冷却期，回退后有三十天冷却期。
+任务进入持久化队列并等待维护窗口。执行前重新检查对象、索引重叠、磁盘余量、长事务、复制状态和窗口余额。受阻任务保留 `next_attempt_at`，调度器继续处理下一条符合条件的任务。等待两天的任务优先，锁冲突、超时等可重试错误按退避时间重排。`policy.retry_limit` 是连续尝试告警阈值，达到阈值的临时阻塞任务继续重试，同一任务的同类告警最多每 24 小时写入一次 PostgreSQL 日志。升级前已达到旧上限的任务可在核对后用 `index_steward.retry_job(id)` 重新激活。超过七天没有新证据的普通表建索引候选等待下一次负载采样更新。闲置删除后同一候选有七天重新创建冷却期，回退后有三十天冷却期。
 
-每实例用本机锁串行维护。每轮最多执行一项 DDL。普通表走并发创建和删除，默认候选范围为默认表空间中 1 MiB 至 5 GiB 的永久普通表。连接和排序类候选当前提供建议。单层原生分区表可用 `SELECT index_steward.queue_partition_index('public.events', ARRAY['device_id']::name[]);` 主动排队，并继续受窗口和自动创建开关控制。执行器创建父索引定义、并发创建各子索引并逐个挂接。TimescaleDB 提供 `index_steward.timescale_diagnostics` 视图查看分块 B-tree 覆盖，自动执行仍以原生普通表与显式排队的原生分区表为范围。
+每实例用本机锁串行维护。每轮最多执行一项 DDL。普通表走并发创建和删除，默认候选范围为默认表空间中 1 MiB 至 5 GiB 的永久普通表。连接和排序类候选当前提供建议。单层原生分区表可用 `SELECT index_steward.queue_partition_index('public.events', ARRAY['device_id']::name[]);` 主动排队，并继续受窗口和自动创建开关控制。执行器创建父索引定义、并发创建各子索引并逐个挂接。PG14 与 TimescaleDB 2.8.0 组合可用 `SELECT index_steward.queue_timescale_index('public.events', ARRAY['device_id','recorded_at']::name[]);` 给本地未压缩超表排队。该路径逐块提交，正在建立索引的块可能短暂阻塞写入。
 
 HypoPG 1.4.5 的源码随插件编译进 `pg_index_steward.so`。`index_steward.policy.use_hypopg` 默认开启。对部分普通表候选，在执行器连接内以生成的等值模板比较普通 `EXPLAIN` 计划。`detail.plan_evidence` 包含优化器成本与是否使用候选索引。该结果用于理解候选，真实业务效果以建成后的自然流量衡量。
 

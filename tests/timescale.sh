@@ -41,4 +41,27 @@ same "$(sql -c "SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid=i.ind
 sql -c "EXPLAIN SELECT * FROM public.gps WHERE device_id=42 AND recorded_at>='2026-01-01' AND recorded_at<'2026-01-02'" | grep 'pgist_' >/dev/null
 same "$(sql -c "SELECT count(*) FROM public.gps WHERE device_id=42 AND recorded_at>='2026-01-01' AND recorded_at<'2026-01-02'")" 3
 grep -q 'PG Index Steward .*"reason":"timescale_complete"' "$tmp/server.log"
+
+# Block the root before TimescaleDB can write any catalog changes.
+sql <<'SQL'
+UPDATE index_steward.policy SET retry_limit=1;
+SELECT index_steward.queue_timescale_index('public.gps',ARRAY['payload','recorded_at']::name[]);
+SQL
+coproc locker { sql; }
+lock_pid=$locker_PID
+exec {lock_input}>&"${locker[1]}" {lock_output}<&"${locker[0]}"
+printf '%s\n' 'BEGIN;' 'LOCK public.gps IN SHARE UPDATE EXCLUSIVE MODE;' "SELECT 'locked';" >&"$lock_input"
+read -r -t 10 -u "$lock_output" locked
+same "$locked" locked
+worker
+same "$(sql -c "SELECT state||':'||reason||':'||(next_attempt_at>now()) FROM index_steward.jobs WHERE detail->'keys'->>0='payload'")" queued:55P03:true
+same "$(sql -c "SELECT count(*) FROM index_steward.alerts() WHERE kind='retry_threshold' AND reason='55P03'")" 1
+worker
+worker
+same "$(grep -c 'PG Index Steward .*"event":"alert".*"reason":"retry_threshold"' "$tmp/server.log")" 1
+printf '%s\n' 'ROLLBACK;' '\q' >&"$lock_input"
+wait "$lock_pid"
+sql -c "UPDATE index_steward.jobs SET next_attempt_at=now() WHERE detail->'keys'->>0='payload'"
+worker
+same "$(sql -c "SELECT state||':'||attempts FROM index_steward.jobs WHERE detail->'keys'->>0='payload'")" done:2
 printf 'TimescaleDB chunk coverage and index adoption verified on %s\n' "$("$cfg" --version)"
