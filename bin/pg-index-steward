@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.3.0'
+VERSION = '3.4.0'
 
 
 class DatabaseError(RuntimeError):
@@ -823,7 +823,7 @@ def repair_build_residue(db, job, index, cfg, policy):
 
 def partition_children(db, parent):
     return db.rows(f"""SELECT c.oid,n.nspname AS schema,c.relname AS table,c.relkind,
-        c.relpersistence,c.relrowsecurity,c.reltablespace::bigint AS reltablespace,pg_relation_size(c.oid) AS bytes
+        c.relpersistence,c.relrowsecurity,c.reltablespace::bigint AS reltablespace,pg_relation_size(c.oid) AS bytes,h.inhdetachpending
         FROM pg_inherits h JOIN pg_class c ON c.oid=h.inhrelid
         JOIN pg_namespace n ON n.oid=c.relnamespace WHERE h.inhparent={parent}
         ORDER BY c.oid""")
@@ -842,36 +842,41 @@ def queue_partition_repairs(db, policy):
         upsert_job(db, 'create', job['target'], job['signature'], job['detail'])
 
 
-def partition_step(db, job, cfg, remaining, policy):
+def partition_step(db, job, cfg, remaining, policy, node=None):
     detail = job['detail']
-    target = job['target']
+    target = node['oid'] if node else job['target']
+    schema, table = (node['schema'], node['table']) if node else (detail['schema'], detail['table'])
+    name = f"{detail['index']}_{target}" if node else detail['index']
     parent = db.one(f"""SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-        WHERE c.oid={target} AND c.relname={literal(detail['table'])} AND n.nspname={literal(detail['schema'])}
-          AND c.relkind='p' AND NOT c.relispartition AND NOT c.relrowsecurity""")
-    if not parent or extension_managed(db, target, detail['schema'], detail['table']):
+        WHERE c.oid={target} AND c.relname={literal(table)} AND n.nspname={literal(schema)}
+          AND c.relkind='p' AND c.relispartition={literal(node is not None)} AND NOT c.relrowsecurity""")
+    if not parent or extension_managed(db, target, schema, table):
         update_job(db, job, 'cancelled', 'Partitioned table identity changed', 'partition_identity')
         return False
     children = partition_children(db, target)
-    if not children or any(child['relkind'] != 'r' or child['relpersistence'] != 'p' or
+    if any(child['inhdetachpending'] for child in children):
+        defer_job(db, job, 'partition_catalog_changed', policy)
+        return False
+    if any(child['relkind'] not in ('r', 'p') or child['relpersistence'] != 'p' or
                            child['relrowsecurity'] or child['reltablespace'] or
                            not allowed_by_policy({'detail': child}, policy) for child in children):
-        update_job(db, job, 'failed', 'Requires one level of permanent ordinary partitions', 'partition_shape')
+        update_job(db, job, 'failed', 'Requires permanent native partitions within the allowlist', 'partition_shape')
         return False
-    qualified = relation(detail['schema'], detail['table'])
+    qualified = relation(schema, table)
     columns = ', '.join(identifier(name) for name in detail['keys'])
-    index_name = relation(detail['schema'], detail['index'])
-    index = fetch_index(db, detail['schema'], detail['index'], target)
+    index_name = relation(schema, name)
+    index = fetch_index(db, schema, name, target)
     if index and index['valid']:
         update_job(db, job, 'done', 'Parent index is valid', 'partition_complete')
         return False
-    if index is None and covered(db, target, detail['keys']):
+    if node is None and index is None and covered(db, target, detail['keys']):
         update_job(db, job, 'cancelled', 'A parent index covers the candidate', 'already_covered')
         return False
     if index is None:
         if any(child['bytes'] > policy['max_table_bytes'] for child in children):
             defer_job(db, job, 'partition_size_policy', policy)
             return False
-        sql = f"CREATE INDEX {identifier(detail['index'])} ON ONLY {qualified} USING btree ({columns})"
+        sql = f"CREATE INDEX {identifier(name)} ON ONLY {qualified} USING btree ({columns})"
         stage = 'partition_parent'
     else:
         attached = {r['table_oid'] for r in db.rows(f"""SELECT i.indrelid AS table_oid
@@ -882,6 +887,22 @@ def partition_step(db, job, cfg, remaining, policy):
             return False
         child_name = f"{detail['index']}_{child['oid']}"
         child_index = fetch_index(db, child['schema'], child_name, child['oid'])
+        if not child_index:
+            keys = ','.join(literal(key) for key in detail['keys'])
+            equivalent = db.one(f"""SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+                JOIN pg_am am ON am.oid=c.relam WHERE i.indrelid={child['oid']} AND i.indisvalid AND i.indisready
+                  AND NOT i.indisunique AND i.indnatts=i.indnkeyatts AND i.indnatts={len(detail['keys'])}
+                  AND i.indpred IS NULL AND i.indexprs IS NULL AND am.amname='btree'
+                  AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=i.indexrelid)
+                  AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(attnum,pos)
+                     JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+                     JOIN pg_opclass op ON op.oid=i.indclass[k.pos::int-1] AND op.opcdefault
+                     WHERE i.indcollation[k.pos::int-1]=a.attcollation AND i.indoption[k.pos::int-1]=0
+                     ORDER BY k.pos)=ARRAY[{keys}]::text[] ORDER BY c.oid LIMIT 1""")
+            if equivalent:
+                child_name, child_index = equivalent['relname'], {'valid': True}
+        if child['relkind'] == 'p' and (not child_index or not child_index['valid']):
+            return partition_step(db, job, cfg, remaining, policy, child)
         if child_index and not child_index['valid']:
             update_job(db, job, 'failed', 'Inspect invalid partition index before retry', 'partition_child_invalid')
             return False
@@ -910,7 +931,7 @@ def partition_step(db, job, cfg, remaining, policy):
                    f"retry_streak=0,next_attempt_at='-infinity' WHERE id={job['id']}")
         event(db, 'step_completed', job, stage)
     except DatabaseError as error:
-        if retryable(error):
+        if retryable(error) or error.sqlstate in ('42P01', '42704'):
             defer_job(db, job, error.sqlstate, policy, attempted=True)
         else:
             update_job(db, job, 'failed', 'Partition index step failed', error.sqlstate)

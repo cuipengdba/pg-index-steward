@@ -197,6 +197,21 @@ SQL
         same "$(sql "SELECT attached_indexes||'/'||partitions FROM index_steward.partition_index_progress WHERE parent_oid='public.events'::regclass")" 2/2
     fi
 fi
+psql -q <<'SQL'
+UPDATE index_steward.policy SET ddl_per_cycle=10,daily_limit=100;
+CREATE TABLE public.multi_events(ts int,device int) PARTITION BY RANGE(ts);
+CREATE TABLE public.multi_month PARTITION OF public.multi_events FOR VALUES FROM (0) TO (100) PARTITION BY RANGE(ts);
+CREATE TABLE public.multi_day PARTITION OF public.multi_month FOR VALUES FROM (0) TO (50);
+CREATE INDEX multi_day_existing ON public.multi_day(device);
+SELECT index_steward.queue_partition_index('public.multi_events', ARRAY['device']::name[]);
+SQL
+for _ in {1..5}; do worker; done
+same "$(sql "SELECT indisvalid FROM pg_index WHERE indrelid='public.multi_events'::regclass")" t
+same "$(sql "SELECT count(*) FROM pg_inherits WHERE inhrelid='public.multi_day_existing'::regclass")" 1
+sql "CREATE TABLE public.multi_new PARTITION OF public.multi_month FOR VALUES FROM (50) TO (100)" >/dev/null
+same "$(sql "SELECT count(*) FROM pg_index WHERE indrelid='public.multi_new'::regclass AND indisvalid")" 1
+sql "ALTER TABLE public.multi_month DETACH PARTITION public.multi_day; UPDATE index_steward.policy SET ddl_per_cycle=1,daily_limit=25" >/dev/null
+same "$(sql "SELECT indisvalid FROM pg_index WHERE indrelid='public.multi_events'::regclass")" t
 if [[ $(sql "SELECT to_regprocedure('index_steward.retry_job(bigint)') IS NOT NULL") == t ]]; then
     sql "INSERT INTO index_steward.jobs (action,target,signature,detail,state,attempts,retry_streak)
          VALUES('create','public.other'::regclass,'retry-check','{}','failed',12,12)" >/dev/null
