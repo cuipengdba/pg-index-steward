@@ -61,7 +61,7 @@ VALUES('create','public.mixed'::regclass,'promote-fixture',
        '{"schema":"public","table":"mixed","keys":["id"],"index":"pgis_mixed_ha","samples":[]}');
 SQL
 fi
-"$bin/pg_basebackup" -D "$standby" -Xs -R -c fast
+"$bin/pg_basebackup" -D "$standby" -Xs -R -c fast -d "application_name=steward_reader"
 cat >> "$standby/postgresql.conf" <<EOF
 unix_socket_directories = '$tmp/standby-sock'
 EOF
@@ -71,6 +71,43 @@ export PGHOST="$tmp/standby-sock"
 check "$(sql -c 'SELECT pg_is_in_recovery()')" t
 if [[ $mode == timescale ]]; then
     export PGHOST="$old_socket"
+    for _ in {1..100}; do
+        [[ $(sql -c "SELECT EXISTS(SELECT FROM pg_stat_replication WHERE state='streaming' AND replay_lsn IS NOT NULL)") == t ]] && break
+        sleep .1
+    done
+    check "$(sql -c "SELECT EXISTS(SELECT FROM pg_stat_replication WHERE state='streaming' AND replay_lsn IS NOT NULL)")" t
+    if [[ $(sql -c "SELECT count(*) FROM information_schema.columns WHERE table_schema='index_steward' AND table_name='policy' AND column_name='timescale_replica_retirement'") == 1 ]]; then
+        cat > "$tmp/services.conf" <<EOF
+[steward_reader]
+host=$tmp/standby-sock
+dbname=postgres
+EOF
+        export PGSERVICEFILE="$tmp/services.conf"
+        retire_job=$(sql -c "SELECT index_steward.queue_timescale_index('public.events',ARRAY['device']::name[])")
+        cycle
+        check "$(sql -c "SELECT state FROM index_steward.jobs WHERE id=$retire_job")" done
+        retiring=$(sql -c "SELECT detail->'owned_index'->>'oid' FROM index_steward.jobs WHERE id=$retire_job")
+        lsn=$(sql -c 'SELECT pg_current_wal_flush_lsn()')
+        for _ in {1..100}; do
+            [[ $(PGHOST="$tmp/standby-sock" sql -c "SELECT pg_last_wal_replay_lsn()>='$lsn'::pg_lsn") == t ]] && break
+            sleep .1
+        done
+        check "$(PGHOST="$tmp/standby-sock" sql -c "SELECT pg_last_wal_replay_lsn()>='$lsn'::pg_lsn")" t
+        sql -c "UPDATE index_steward.policy SET timescale_replica_retirement=true,replica_services=ARRAY['steward_reader']"
+        cycle --observe-only
+        check "$(sql -c "SELECT count(*) FROM index_steward.replica_usage WHERE service='steward_reader' AND index_oid=$retiring")" 1
+        sql -c "UPDATE index_steward.timescale_usage SET observed_at=now()-interval '2 minutes',idle_since=now()-interval '61 days' WHERE build_job=$retire_job;
+                UPDATE index_steward.replica_usage SET idle_since=now()-interval '61 days' WHERE service='steward_reader'"
+        PGHOST="$tmp/standby-sock" sql -c "SET enable_seqscan=off; SELECT count(*) FROM public.events WHERE device=1" >/dev/null
+        sleep 1.1
+        cycle
+        check "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE action='drop' AND target=$retiring")" queued:replica_usage_unverified
+        sql -c "UPDATE index_steward.replica_usage SET idle_since=now()-interval '61 days' WHERE service='steward_reader';
+                UPDATE index_steward.jobs SET next_attempt_at=now() WHERE action='drop' AND target=$retiring"
+        cycle
+        check "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE action='drop' AND target=$retiring")" done:idle
+        sql -c "UPDATE index_steward.policy SET timescale_replica_retirement=false,replica_services='{}'"
+    fi
     job=$(sql -c "SELECT index_steward.queue_timescale_index('public.events',ARRAY['device','ts']::name[])")
     chunk=$(sql -c "SELECT show_chunks('public.events') LIMIT 1")
     coproc locker { sql; }
