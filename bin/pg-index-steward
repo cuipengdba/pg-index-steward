@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.4.0'
+VERSION = '3.5.0'
 
 
 class DatabaseError(RuntimeError):
@@ -1158,14 +1158,25 @@ def timescale_reconcile(db, job, index, policy):
 
 def timescale_build_budget(db, job, target, cfg, policy):
     rate = policy['timescale_build_mib_per_second'] * MIB
-    estimate = max(MIN_DDL_WINDOW_SECONDS, math.ceil((target['bytes'] + target['largest_chunk']) / rate)
-                   + math.ceil(target['chunks'] / 4) + 5)
+    history = db.one(f"""SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY elapsed_seconds *
+          greatest(1.0,{target['bytes']}::float8/greatest(bytes,1),{target['chunks']}::float8/greatest(chunks,1))) AS seconds
+        FROM (SELECT bytes,chunks,elapsed_seconds FROM {SCHEMA}.timescale_build_history
+          WHERE table_oid={target['oid']} AND method={literal(job['detail']['method'])}
+            AND bytes BETWEEN {target['bytes']//4} AND {target['bytes']*4}
+            AND chunks BETWEEN {target['chunks']//4} AND {target['chunks']*4}
+            AND finished_at>now()-interval '90 days' ORDER BY finished_at DESC LIMIT 12) h""")['seconds']
+    estimate = (math.ceil(history * 1.5) + 5 if history is not None else
+                math.ceil((target['bytes'] + target['largest_chunk']) / rate) + math.ceil(target['chunks'] / 4) + 5)
+    estimate = max(MIN_DDL_WINDOW_SECONDS, estimate)
     need = max(estimate, job['required_seconds'])
-    job['detail']['build_estimate'] = {'seconds': need, 'bytes': target['bytes'], 'largest_chunk': target['largest_chunk']}
+    capacity = min(policy['ddl_timeout_seconds'] + 5, window_capacity(cfg['maintenance_window']))
+    job['detail']['build_estimate'] = {'seconds': need, 'capacity_seconds': capacity, 'bytes': target['bytes'],
+                                      'largest_chunk': target['largest_chunk'],
+                                      'source': 'history' if history is not None else 'size'}
     db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{build_estimate}}',"
                f"{json_value(job['detail']['build_estimate'])}) "
                f"WHERE id={job['id']}")
-    if need > min(policy['ddl_timeout_seconds'] + 5, window_capacity(cfg['maintenance_window'])):
+    if need > capacity:
         defer_job(db, job, 'timescale_budget_policy', policy)
         return 0
     return ddl_budget(db, policy, {**job, 'required_seconds': need})
@@ -1236,7 +1247,10 @@ def timescale_create(db, job, cfg, policy):
         if not index or not index['valid'] or not index['ready'] or coverage['chunks'] != coverage['indexed']:
             update_job(db, job, 'failed', 'Hypertable index coverage requires repair', 'timescale_coverage')
         else:
-            elapsed = max(1, math.ceil(time.monotonic() - started))
+            elapsed = max(.001, time.monotonic() - started)
+            db.execute(f"""INSERT INTO {SCHEMA}.timescale_build_history(job_id,table_oid,method,bytes,chunks,elapsed_seconds)
+                VALUES ({job['id']},{target['oid']},{literal(method)},{target['bytes']},{target['chunks']},{elapsed})
+                ON CONFLICT (job_id) DO NOTHING""")
             db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{build_elapsed_seconds}}',"
                        f"to_jsonb({elapsed})) WHERE id={job['id']}")
             finish_timescale_build(db, job, index)
