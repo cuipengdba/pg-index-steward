@@ -372,6 +372,10 @@ def upsert_job(db, action, target, signature, detail):
                          AND retired.detail->>'name'={literal(detail.get('index'))}
                          AND retired.detail->>'schema'={literal(detail.get('schema'))}
                          AND retired.updated_at>clock_timestamp()-interval '7 days'))
+                   AND ({literal(action)}<>'create' OR NOT EXISTS (
+                       SELECT FROM {SCHEMA}.jobs old_build
+                       WHERE old_build.action='create' AND old_build.target={target} AND old_build.signature={literal(signature)}
+                         AND (old_build.detail->>'retired_at')::timestamptz>clock_timestamp()-interval '7 days'))
                    ON CONFLICT (action,target,signature) WHERE state IN ('queued','running')
                    DO UPDATE SET detail=CASE WHEN jobs.detail @> '{{"timescale":true}}'::jsonb
                               THEN jobs.detail || (excluded.detail - ARRAY['index','source','advisory']) ||
@@ -648,6 +652,7 @@ def observe_primary_epoch(db, policy):
         UPDATE {SCHEMA}.policy SET primary_epoch={literal(epoch)},primary_epoch_at=now() WHERE singleton;
         DELETE FROM {SCHEMA}.replica_usage;
         UPDATE {SCHEMA}.index_usage SET idle_since=now();
+        UPDATE {SCHEMA}.timescale_usage SET idle_since=now();
         DELETE FROM {SCHEMA}.workload;
         COMMIT""")
     event(db, 'primary_epoch_changed', reason='timeline_changed')
@@ -735,7 +740,7 @@ def ddl_budget(db, policy, job):
     if job['action'] == 'analyze':
         enabled = current and current.get('auto_analyze')
     if job['detail'].get('timescale'):
-        enabled = enabled and current and current.get('timescale_create')
+        enabled = enabled and current and current.get('timescale_create' if job['action'] == 'create' else 'timescale_retirement')
         if job['detail'].get('source') == 'workload':
             enabled = enabled and current['timescale_discovery'] == 'execute'
     if (not current or current['paused'] or seconds < MIN_DDL_WINDOW_SECONDS or
@@ -977,6 +982,12 @@ def record_timescale_progress(db, job, coverage):
     db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{coverage}}',{json_value(coverage)}) WHERE id={job['id']}")
 
 
+def finish_timescale_build(db, job, index):
+    marker = {key: index[key] for key in ('oid', 'fingerprint')}
+    db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{owned_index}}',{json_value(marker)}) WHERE id={job['id']}")
+    update_job(db, job, 'done', 'Root index is valid and all chunks are covered', 'timescale_complete')
+
+
 def timescale_index_matches(db, job, index):
     detail = job['detail']
     keys = ','.join(literal(key) for key in detail['keys'])
@@ -1004,7 +1015,7 @@ def timescale_reconcile(db, job, index, policy):
     if detail.get('build_epoch') and detail['build_epoch'] != policy['primary_epoch']:
         event(db, 'timescale_reconciled', job, 'timeline_changed')
     if index['valid'] and index['ready'] and coverage['chunks'] == coverage['indexed']:
-        update_job(db, job, 'done', 'Root index is valid and all chunks are covered', 'timescale_complete')
+        finish_timescale_build(db, job, index)
         return False
     if index['valid']:
         update_job(db, job, 'failed', 'Inspect valid root with incomplete chunk coverage', 'timescale_coverage')
@@ -1123,7 +1134,7 @@ def timescale_create(db, job, cfg, policy):
             elapsed = max(1, math.ceil(time.monotonic() - started))
             db.execute(f"UPDATE {SCHEMA}.jobs SET detail=jsonb_set(detail,'{{build_elapsed_seconds}}',"
                        f"to_jsonb({elapsed})) WHERE id={job['id']}")
-            update_job(db, job, 'done', 'Root index is valid and all chunks are covered', 'timescale_complete')
+            finish_timescale_build(db, job, index)
     except DatabaseError as error:
         if retryable(error):
             if error.sqlstate == '57014' and time.monotonic() - started >= budget - 1:
@@ -1135,6 +1146,118 @@ def timescale_create(db, job, cfg, policy):
             update_job(db, job, 'failed', 'Hypertable build requires inspection', 'timescale_interrupted')
     finally:
         db.execute("SET statement_timeout='15s'")
+    return True
+
+
+def timescale_usage(db, job, index):
+    name = literal(job['detail']['index'])
+    return db.one(f"""WITH children AS (
+        SELECT ci.oid,ci.relfilenode FROM _timescaledb_catalog.chunk_index m
+        JOIN _timescaledb_catalog.chunk ch ON ch.id=m.chunk_id AND NOT ch.dropped
+        JOIN pg_namespace n ON n.nspname=ch.schema_name
+        JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=ch.table_name
+        JOIN pg_inherits inh ON inh.inhrelid=c.oid AND inh.inhparent={job['target']}
+        JOIN pg_index ix ON ix.indrelid=c.oid AND ix.indisvalid AND ix.indisready
+        JOIN pg_class ci ON ci.oid=ix.indexrelid AND ci.relname=m.index_name
+        WHERE m.hypertable_index_name={name}
+    ), nodes AS (
+        SELECT * FROM children UNION ALL SELECT oid,relfilenode FROM pg_class WHERE oid={index['oid']}
+    ) SELECT jsonb_build_object('objects',jsonb_agg(jsonb_build_array(nodes.oid,nodes.relfilenode,s.idx_scan,
+            to_jsonb(s)->>'last_idx_scan') ORDER BY nodes.oid),
+        'reset', concat_ws('|',pg_postmaster_start_time()::text,d.stats_reset::text)) AS snapshot,
+        bool_or(EXISTS(SELECT FROM {SCHEMA}.retention_policy p WHERE p.index_oid=nodes.oid
+             AND p.definition=pg_get_indexdef(nodes.oid) AND p.preserve_until>now())) AS protected,
+        bool_or(EXISTS(SELECT FROM pg_constraint c WHERE c.conindid=nodes.oid) OR
+                EXISTS(SELECT FROM pg_depend d WHERE d.refclassid='pg_class'::regclass AND d.refobjid=nodes.oid) OR
+                EXISTS(SELECT FROM pg_index i WHERE i.indexrelid=nodes.oid AND
+                       (i.indisunique OR i.indisreplident OR i.indisclustered OR EXISTS (
+                         SELECT FROM pg_constraint fk WHERE fk.contype='f' AND fk.conrelid=i.indrelid
+                         AND cardinality(fk.conkey)<=i.indnkeyatts AND fk.conkey <@ ARRAY(
+                             SELECT key FROM unnest(i.indkey) WITH ORDINALITY k(key,pos)
+                             WHERE pos<=cardinality(fk.conkey))
+                       )))) AS dependent
+      FROM nodes JOIN pg_stat_all_indexes s ON s.indexrelid=nodes.oid
+      CROSS JOIN pg_stat_database d WHERE d.datname=current_database() GROUP BY d.stats_reset""")
+
+
+def observe_timescale_indexes(db, policy):
+    if not timescale_supported(db):
+        return
+    builds = db.rows(f"""SELECT j.* FROM {SCHEMA}.jobs j LEFT JOIN {SCHEMA}.timescale_usage u ON u.build_job=j.id
+        WHERE j.state='done' AND j.action='create' AND j.detail @> '{{"timescale":true}}'::jsonb
+          AND (u.observed_at IS NULL OR u.observed_at<now()-interval '1 minute')
+          AND j.detail->>'retired_at' IS NULL
+        ORDER BY u.observed_at NULLS FIRST,j.id LIMIT 50""")
+    for job in builds:
+        detail = job['detail']
+        index = fetch_index(db, detail['schema'], detail['index'], job['target'])
+        owned = detail.get('owned_index')
+        if not index:
+            db.execute(f"UPDATE {SCHEMA}.jobs SET detail=detail||jsonb_build_object('retired_at',now()) WHERE id={job['id']}")
+            continue
+        coverage = timescale_coverage(db, job)
+        if coverage != detail.get('coverage'):
+            record_timescale_progress(db, job, coverage)
+            event(db, 'timescale_coverage_changed', job, 'chunk_inventory')
+        usage = timescale_usage(db, job, index)
+        if not usage:
+            continue
+        snapshot = json_value(usage['snapshot'])
+        idle = db.execute(f"""INSERT INTO {SCHEMA}.timescale_usage AS old
+          VALUES ({job['id']},{snapshot},now(),now()) ON CONFLICT (build_job) DO UPDATE SET
+          observed_at=now(),snapshot=excluded.snapshot,idle_since=CASE WHEN old.snapshot=excluded.snapshot
+            AND old.observed_at>now()-interval '24 hours' THEN old.idle_since ELSE now() END
+          RETURNING idle_since<=now()-make_interval(days=>{policy['idle_days']})""")[0] == 't'
+        if (idle and owned and index['oid'] == owned['oid'] and index['fingerprint'] == owned['fingerprint']
+                and index['valid'] and coverage['chunks'] == coverage['indexed']
+                and not usage['protected'] and not usage['dependent'] and timescale_index_matches(db, job, index)):
+            upsert_job(db, 'drop', index['oid'], index['fingerprint'],
+                       dict(timescale=True, managed=True, schema=detail['schema'], table=detail['table'],
+                            name=detail['index'], build_job=job['id'], ddl=index['ddl']))
+
+
+def retire_timescale_index(db, job, guards, policy):
+    if not policy['timescale_retirement'] or not guards['no_replica_evidence'] or policy['replica_services']:
+        defer_job(db, job, 'timescale_retirement_policy' if not policy['timescale_retirement'] else 'replica_usage_unverified', policy)
+        return False
+    if not timescale_supported(db):
+        update_job(db, job, 'cancelled', 'TimescaleDB pairing changed', 'timescale_version')
+        return False
+    build = db.one(f"SELECT * FROM {SCHEMA}.jobs WHERE id={job['detail']['build_job']} AND state='done' AND action='create'")
+    budget = ddl_budget(db, policy, job)
+    if not budget:
+        return False
+    update_job(db, job, 'running', 'Checking hypertable index for retirement', 'timescale_retirement')
+    detail = job['detail']
+    try:
+        db.execute('BEGIN')
+        db.execute(f"SET LOCAL statement_timeout='{min(budget, 3)}s'; SET LOCAL lock_timeout='250ms'")
+        db.execute(f"LOCK TABLE {relation(detail['schema'],detail['table'])} IN ACCESS EXCLUSIVE MODE")
+        db.execute(f"SELECT {SCHEMA}.lock_index({job['target']}::oid); SELECT pg_stat_clear_snapshot()")
+        index = fetch_index(db, detail['schema'], detail['name'], build['target']) if build else None
+        target = timescale_inventory(db, build) if build else None
+        usage = timescale_usage(db, build, index) if index else None
+        evidence = db.one(f"""SELECT snapshot FROM {SCHEMA}.timescale_usage WHERE build_job={detail['build_job']}
+             AND observed_at>now()-interval '5 minutes' AND idle_since<=now()-make_interval(days=>{policy['idle_days']})""")
+        if (not target or not usage or not evidence or usage['snapshot'] != evidence['snapshot'] or usage['protected'] or usage['dependent']
+                or not index['valid'] or index['oid'] != job['target'] or index['fingerprint'] != job['signature']
+                or build['detail'].get('owned_index') != {'oid': index['oid'], 'fingerprint': index['fingerprint']}
+                or len(usage['snapshot']['objects']) != target['chunks'] + 1
+                or target['compression_enabled'] or target['distributed'] or not timescale_index_matches(db, build, index)
+                or not protect(db, job)['no_replica_evidence']):
+            db.execute('ROLLBACK')
+            update_job(db, job, 'cancelled', 'Hypertable retirement evidence changed', 'timescale_retirement_review')
+            return True
+        db.execute(f"DROP INDEX {relation(detail['schema'],detail['name'])}")
+        db.execute(f"UPDATE {SCHEMA}.jobs SET detail=detail||jsonb_build_object('retired_at',now()) WHERE id={build['id']}")
+        update_job(db, job, 'done', 'Retired an idle hypertable index', 'idle')
+        db.execute('COMMIT')
+    except DatabaseError as error:
+        db.execute('ROLLBACK')
+        if retryable(error):
+            defer_job(db, job, error.sqlstate, policy, attempted=True)
+        else:
+            update_job(db, job, 'failed', 'Hypertable retirement requires inspection', error.sqlstate)
     return True
 
 
@@ -1239,6 +1362,8 @@ def analyze_table(db, job, policy):
 
 
 def drop_index(db, job, cfg, guards, remaining, policy):
+    if job['detail'].get('timescale'):
+        return retire_timescale_index(db, job, guards, policy)
     rows = index_inventory(db, job['target'], policy['idle_days'])
     if not rows or rows[0]['fingerprint'] != job['signature']:
         update_job(db, job, 'cancelled', 'Index identity or dependencies changed')
@@ -1440,6 +1565,7 @@ def run_cycle(db, cfg, allow_ddl):
         queue_partition_repairs(db, policy)
         propose_statistics(db, policy)
         observe_indexes(db, policy)
+        observe_timescale_indexes(db, policy)
         verified_replicas = observe_replicas(db, policy)
         measure(db, deltas, policy)
         emit_alerts(db)

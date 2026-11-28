@@ -138,4 +138,20 @@ sql -c "UPDATE index_steward.policy SET timescale_legacy_compression=true; UPDAT
 worker
 same "$(sql -c "SELECT state||':'||(detail->'coverage'->>'indexed') FROM index_steward.jobs WHERE detail->>'table'='compressed_metrics'")" done:2
 same "$(sql -c "SELECT count(*) FROM public.compressed_metrics WHERE val IN (42,9000)")" 2
+
+sql -c "INSERT INTO public.gps VALUES ('2026-01-08 UTC',42,'new'); UPDATE index_steward.timescale_usage SET observed_at=now()-interval '2 minutes'"
+worker --observe-only
+same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='gps' AND state='done' AND detail->'coverage'->>'indexed'='5'")" 4
+sql -c "SELECT drop_chunks('public.gps',older_than=>'2026-01-02 UTC'::timestamptz); UPDATE index_steward.timescale_usage SET observed_at=now()-interval '2 minutes'"
+worker --observe-only
+same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='gps' AND state='done' AND detail->'coverage'->>'indexed'='4'")" 4
+job=$(sql -c "SELECT id FROM index_steward.jobs WHERE detail->>'table'='gps' AND detail->'keys'='[\"recorded_at\",\"device_id\"]'")
+oid=$(sql -c "SELECT detail->'owned_index'->>'oid' FROM index_steward.jobs WHERE id=$job")
+sql -c "SELECT index_steward.protect_index($oid::regclass); UPDATE index_steward.timescale_usage SET observed_at=now()-interval '2 minutes',idle_since=now()-interval '61 days' WHERE build_job=$job;"
+worker
+same "$(sql -c "SELECT count(*) FROM pg_index WHERE indexrelid=$oid")" 1
+sql -c "DELETE FROM index_steward.retention_policy WHERE index_oid=$oid; UPDATE index_steward.timescale_usage SET observed_at=now()-interval '2 minutes' WHERE build_job=$job;"
+worker
+same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE action='drop' AND target=$oid")" done:idle
+same "$(sql -c "SELECT count(*) FROM pg_index WHERE indexrelid=$oid")" 0
 printf 'TimescaleDB chunk coverage and index adoption verified on %s\n' "$("$cfg" --version)"
