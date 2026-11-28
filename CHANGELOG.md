@@ -1,4 +1,8 @@
-# PG Index Steward 3.13.0
+# PG Index Steward 3.14.0
+
+- 查询 Hypercore 布局与稀疏索引配置，隔离 CI 采集原 SQL 的列存执行计划与基线。
+
+## 3.13.0
 
 - 增加 TimescaleDB 兼容状态查询及实验开关验收。上游 2.32.1 的 PG19 构建仍为实验状态。
 
