@@ -71,6 +71,11 @@ export PGHOST="$tmp/standby-sock"
 check "$(sql -c 'SELECT pg_is_in_recovery()')" t
 if [[ $mode == timescale ]]; then
     export PGHOST="$old_socket"
+    for _ in {1..100}; do
+        [[ $(sql -c "SELECT EXISTS(SELECT FROM pg_stat_replication WHERE state='streaming' AND replay_lsn IS NOT NULL)") == t ]] && break
+        sleep .1
+    done
+    check "$(sql -c "SELECT EXISTS(SELECT FROM pg_stat_replication WHERE state='streaming' AND replay_lsn IS NOT NULL)")" t
     job=$(sql -c "SELECT index_steward.queue_timescale_index('public.events',ARRAY['device','ts']::name[])")
     chunk=$(sql -c "SELECT show_chunks('public.events') LIMIT 1")
     coproc locker { sql; }
