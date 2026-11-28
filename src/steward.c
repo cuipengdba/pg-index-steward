@@ -25,7 +25,7 @@ steward_lock_index(PG_FUNCTION_ARGS)
 }
 
 #if PG_VERSION_NUM >= 190000
-PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "3.6.0");
+PG_MODULE_MAGIC_EXT(.name = "pg_index_steward", .version = "3.7.0");
 #else
 PG_MODULE_MAGIC;
 #endif

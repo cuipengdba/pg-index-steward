@@ -111,6 +111,7 @@ SELECT 'SELECT pg_sleep(0.06), count(*) FROM public.metrics WHERE device=42 AND 
 SQL
 worker
 same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='metrics' AND detail @> '{\"advisory\":true,\"method\":\"btree\",\"source\":\"workload\"}'")" 1
+same "$(sql -c "SELECT detail->>'workload_queries' FROM index_steward.jobs WHERE detail->>'table'='metrics' AND detail->>'source'='workload'")" 1
 sql -c "SELECT index_steward.queue_timescale_index('public.metrics',ARRAY['device','ts']::name[]);"
 worker
 same "$(sql -c "SELECT count(*) FROM index_steward.jobs WHERE detail->>'table'='metrics' AND state='done' AND detail->>'method'='btree'")" 1

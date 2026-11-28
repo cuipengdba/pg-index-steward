@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.6.0'
+VERSION = '3.7.0'
 
 
 class DatabaseError(RuntimeError):
@@ -409,10 +409,12 @@ def hypothetical_probe(db, detail):
     db.execute("SET plan_cache_mode='force_generic_plan'; SET statement_timeout='3s'")
     try:
         baseline = plan()
-        created = db.one(f"SELECT indexname FROM {SCHEMA}.hypo_create({literal(f'CREATE INDEX ON {qualified_table} USING btree ({columns})')})")
+        created = db.one(f"SELECT indexrelid,indexname FROM {SCHEMA}.hypo_create({literal(f'CREATE INDEX ON {qualified_table} USING btree ({columns})')})")
+        size = db.one(f"SELECT {SCHEMA}.hypo_size({created['indexrelid']}::oid) AS bytes")['bytes']
         proposed = plan()
         return {'method': 'generated_generic_equality_probe', 'before_cost': baseline['Total Cost'],
-                'after_cost': proposed['Total Cost'], 'uses_candidate': created['indexname'] in json.dumps(proposed)}
+                'after_cost': proposed['Total Cost'], 'estimated_bytes': size,
+                'uses_candidate': created['indexname'] in json.dumps(proposed)}
     except DatabaseError as error:
         return {'method': 'generated_generic_equality_probe', 'error': error.sqlstate or 'unavailable'}
     finally:
@@ -978,6 +980,7 @@ def propose_timescale(db, deltas, policy):
     if policy['timescale_discovery'] == 'off' or not timescale_supported(db):
         return
     hypertables = {}
+    proposals = {}
     for query in islice((row for row in deltas if row['calls'] >= MIN_CALLS and row['elapsed'] >= MIN_TOTAL_MS), 30):
         for shape in query['candidate_shape']:
             if shape.get('advisory'):
@@ -1026,9 +1029,16 @@ def propose_timescale(db, deltas, policy):
                 FROM pg_inherits i JOIN pg_stat_all_tables s ON s.relid=i.inhrelid WHERE i.inhparent={target['oid']}""")['rows']
             detail.update(keys=keys, method=method, index='pgist_' + signature, score=query['elapsed'],
                           estimated_table_bytes=target['bytes'], observed_chunk_writes=writes)
-            if writes > 0 and method == 'btree':
-                detail['score'] /= 1 + min(4, writes / max(1, target['bytes'] / 256))
-            upsert_job(db, 'create', target['oid'], signature, detail)
+            entry = proposals.setdefault((target['oid'], signature), detail)
+            sample = {key: query[key] for key in ('userid', 'queryid', 'toplevel', 'calls', 'elapsed', 'reads',
+                                                 'hits', 'wal_bytes', 'sampled_epoch', 'period_seconds')}
+            if sample not in entry['samples']:
+                entry['samples'].append(sample)
+    for (target, signature), detail in rank_portfolio(proposals):
+        detail['workload_queries'] = len(detail['samples'])
+        if detail['method'] == 'btree':
+            detail['score'] /= 1 + min(4, detail['observed_chunk_writes'] / max(1, detail['estimated_table_bytes'] / 256))
+        upsert_job(db, 'create', target, signature, detail)
 
 
 def timescale_definition_indexes(db, job):
