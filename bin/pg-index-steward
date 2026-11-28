@@ -31,7 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
-VERSION = '3.11.0'
+VERSION = '3.12.0'
 
 
 class DatabaseError(RuntimeError):
@@ -694,6 +694,7 @@ def update_job(db, job, state, message, reason=None):
                    attempts=attempts+CASE WHEN {literal(state)}='running' THEN 1 ELSE 0 END,
                    retry_streak=retry_streak+CASE WHEN {literal(state)}='running' THEN 1 ELSE 0 END,
                    blocked_since=CASE WHEN {literal(state)} IN ('queued','running') THEN blocked_since END,
+                   reserved_at=CASE WHEN {literal(state)}='queued' THEN reserved_at END,
                    blocker_checks=CASE WHEN {literal(state)} IN ('queued','running') THEN blocker_checks ELSE 0 END,
                    last_started_at=CASE WHEN {literal(state)}='running' THEN clock_timestamp() ELSE last_started_at END,
                    updated_at=clock_timestamp() WHERE id={job['id']} RETURNING id,attempts)
@@ -762,7 +763,8 @@ def reserve_next_window(db, job, cfg):
     retry = db.execute(f"""WITH timing AS (
         SELECT current_date + {literal(start)}::time AS boundary, localtimestamp AS current_time
     ), saved AS (
-        UPDATE {SCHEMA}.jobs SET reason='window_capacity',message='Waiting for enough time in the next window',
+        UPDATE {SCHEMA}.jobs SET state='queued',reason='window_capacity',message='Waiting for enough time in the next window',
+        reserved_at=coalesce(reserved_at,clock_timestamp()),
         next_attempt_at=(SELECT (boundary + CASE WHEN boundary<=current_time THEN interval '1 day'
                              ELSE interval '0' END) AT TIME ZONE current_setting('TimeZone') FROM timing)
         WHERE id={job['id']} RETURNING next_attempt_at::text
@@ -1236,6 +1238,8 @@ def timescale_create(db, job, cfg, policy):
         return False
     existing = fetch_index(db, detail['schema'], detail['index'], target['oid'])
     if existing:
+        if not existing['valid'] and job['budget_timeouts'] and not timescale_build_budget(db, job, target, cfg, policy):
+            return False
         return timescale_reconcile(db, job, existing, policy)
     method = detail['method']
     if method not in ('btree', 'brin'):
@@ -1285,7 +1289,12 @@ def timescale_create(db, job, cfg, policy):
             if error.sqlstate == '57014' and time.monotonic() - started >= budget - 1:
                 capacity = min(policy['ddl_timeout_seconds'] + 5, window_capacity(cfg['maintenance_window']))
                 db.execute(f"UPDATE {SCHEMA}.jobs SET required_seconds=greatest(required_seconds,"
-                           f"{min(capacity, budget * 2 + 5)}) WHERE id={job['id']}")
+                           f"{min(14405, budget * 2 + 5)}),budget_timeouts=budget_timeouts+1 WHERE id={job['id']}")
+                if budget + 5 >= capacity:
+                    defer_job(db, job, 'timescale_budget_policy', policy, attempted=True)
+                    return True
+                reserve_next_window(db, job, cfg)
+                return True
             defer_job(db, job, error.sqlstate, policy, attempted=True)
         else:
             update_job(db, job, 'failed', 'Hypertable build requires inspection', 'timescale_interrupted')
@@ -1801,6 +1810,7 @@ def run_cycle(db, cfg, allow_ddl):
                            OR CASE WHEN COALESCE((detail->>'managed')::boolean,false)
                                    THEN {literal(cfg['auto_drop_managed'])} ELSE {literal(cfg['auto_drop_existing'])} END)
                        ORDER BY COALESCE((detail->>'rollback')::boolean,false) DESC,
+                                reserved_at NULLS LAST,
                                 (created_at<clock_timestamp()-interval '2 days') DESC,
                                 CASE WHEN created_at<clock_timestamp()-interval '2 days' THEN created_at END,
                                 (reason='blocker_cleared') DESC NULLS LAST,

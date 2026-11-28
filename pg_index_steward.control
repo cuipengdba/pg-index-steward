@@ -1,5 +1,5 @@
 comment = 'Workload-aware index recommendations and controlled index lifecycle'
-default_version = '3.11.0'
+default_version = '3.12.0'
 module_pathname = '$libdir/pg_index_steward'
 requires = 'pg_stat_statements'
 schema = 'index_steward'
