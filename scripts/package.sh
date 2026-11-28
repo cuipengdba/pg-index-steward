@@ -10,10 +10,12 @@ stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 name="pg-index-steward-$version-linux-$arch"
 bundle="$stage/$name"
-mkdir -p "$bundle/bin" "$bundle/sql" "$out"
+mkdir -p "$bundle/bin" "$bundle/sql" "$bundle/assets" "$out"
 install -m 0755 "$root/install.sh" "$bundle/"
 install -m 0755 "$root/bin/pg-index-steward" "$bundle/bin/"
 install -m 0644 "$root/pg_index_steward.control" "$root/README.md" "$root/LICENSE" "$bundle/"
+install -m 0644 "$root/assets/steward.svg" "$bundle/assets/"
+test "$(python3 "$root/bin/pg-index-steward" --version)" = "PG Index Steward $version"
 for document in CHANGELOG.md ROADMAP.md; do
     if [[ -f $root/$document ]]; then
         install -m 0644 "$root/$document" "$bundle/"

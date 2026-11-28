@@ -31,6 +31,7 @@ KEY_TYPES = {16, 20, 21, 23, 25, 26, 700, 701, 1042, 1043, 1082, 1083,
              1114, 1184, 1186, 1266, 1700, 2950, 3220}
 MIB = 1024 * 1024
 MIN_DDL_WINDOW_SECONDS = 30
+VERSION = '3.0.0'
 
 
 class DatabaseError(RuntimeError):
@@ -1540,6 +1541,9 @@ def recover_jobs(db, policy):
 def run_cycle(db, cfg, allow_ddl):
     if cfg['recovery'] or cfg['read_only']:
         return
+    installed = db.one("SELECT extversion FROM pg_extension WHERE extname='pg_index_steward'")
+    if not installed or installed['extversion'] != VERSION:
+        raise DatabaseError('Install and upgrade the extension to the runner version', '55000')
     datadir = Path(cfg['data_directory'])
     if not (datadir / 'PG_VERSION').is_file():
         raise DatabaseError('Use the runner on the PostgreSQL host with its data directory mounted')
@@ -1662,6 +1666,7 @@ def report(db, as_metrics=False, service=None, headers=True):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', action='version', version=f'PG Index Steward {VERSION}')
     parser.add_argument('--libpq', default=os.environ.get('PGSTEWARD_LIBPQ', 'libpq.so.5'))
     parser.add_argument('--conninfo', default='')
     parser.add_argument('--interval', type=int, default=900)

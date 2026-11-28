@@ -25,7 +25,7 @@ same() { [[ $1 == "$2" ]] || { printf 'expected %s, got %s\n' "$2" "$1" >&2; exi
 sql <<'SQL'
 CREATE EXTENSION timescaledb;
 CREATE EXTENSION pg_stat_statements;
-CREATE EXTENSION pg_index_steward;
+CREATE EXTENSION pg_index_steward VERSION '2.1.0';
 CREATE TABLE public.gps(recorded_at timestamptz NOT NULL, device_id int NOT NULL, payload text);
 SELECT create_hypertable('public.gps','recorded_at',chunk_time_interval=>interval '1 day');
 INSERT INTO public.gps SELECT '2026-01-01 UTC'::timestamptz + i*interval '30 seconds',
@@ -34,7 +34,15 @@ ANALYZE public.gps;
 UPDATE index_steward.policy SET min_free_bytes=0;
 SELECT index_steward.queue_timescale_index('public.gps',ARRAY['device_id','recorded_at']::name[]);
 SQL
+same "$(sql -c "SELECT extversion FROM pg_extension WHERE extname='pg_index_steward'")" 2.1.0
+if worker 2>"$tmp/version.err"; then
+    echo 'Expected runner to reject the unupgraded extension' >&2; exit 1
+fi
+grep -q '(55000)' "$tmp/version.err"
+same "$(sql -c "SELECT state||':'||attempts FROM index_steward.jobs WHERE id=1")" queued:0
+sql -c 'ALTER EXTENSION pg_index_steward UPDATE'
 worker
+same "$(sql -c "SELECT min_free_bytes FROM index_steward.policy")" 0
 same "$(sql -c "SELECT state||':'||reason FROM index_steward.jobs WHERE detail->>'table'='gps'")" done:timescale_complete
 same "$(sql -c "SELECT detail->'coverage'->>'indexed' FROM index_steward.jobs WHERE detail->>'table'='gps'")" 4
 same "$(sql -c "SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid='public.gps'::regclass AND left(c.relname,6)='pgist_'")" t
